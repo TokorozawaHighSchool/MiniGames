@@ -1,0 +1,2519 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Forest FPS MVP</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="overlay">
+  <button id="startBtn">クリックして開始（Pointer Lock）</button>
+  <button id="fullscreen-toggle" aria-label="フルスクリーン切替" style="margin-left:8px">⤢</button>
+  <div id="hint">WASD 移動 ・ マウスで視点 ・ Eで拾う/アクション ・ Iでインベントリ ・ Shiftでダッシュ（スタミナ消費・自動回復） ・ Mでマップ</div>
+  </div>
+  <div id="hud" style="position:fixed;left:12px;top:12px;color:#022;font-weight:700;background:rgba(255,255,255,0.85);padding:6px 10px;border-radius:6px">Score: <span id="score">0</span>
+    <div id="coords" style="font-weight:400;margin-top:6px;font-size:12px">x:0.00 y:0.00 z:0.00</div>
+  </div>
+  <!-- Stamina bar (top center) -->
+  <div id="stamina-wrap" style="position:fixed;left:50%;transform:translateX(-50%);top:8px;width:40%;max-width:600px;">
+    <div style="background:rgba(0,0,0,0.55);padding:6px;border-radius:8px;color:#fff;font-size:13px;text-align:center">Stamina</div>
+    <div style="background:rgba(0,0,0,0.25);height:10px;border-radius:6px;margin-top:6px">
+      <div id="stamina-bar" style="height:100%;width:100%;background:linear-gradient(90deg,#7cf,#06f);border-radius:6px;transform-origin:left"></div>
+    </div>
+  </div>
+  <!-- Health (bottom-left, large rectangular bar, no label) -->
+  <div id="health-wrap" style="position:fixed;left:12px;bottom:12px;z-index:9999;">
+    <div id="battery-wrap" style="position:absolute;left:0;bottom:36px;width:260px;height:18px;background:rgba(255,255,255,0.95);border-radius:2px;box-shadow:0 2px 6px rgba(0,0,0,0.25);outline:1px solid rgba(0,0,0,0.25);display:flex;gap:4px;align-items:center;padding:2px 6px;">
+      <div style="font-size:12px;color:#111;font-weight:700;margin-right:6px">Battery</div>
+      <div id="bat-cell-1" style="flex:1;height:10px;border-radius:2px;background:#2ecc71;opacity:1"></div>
+      <div id="bat-cell-2" style="flex:1;height:10px;border-radius:2px;background:#2ecc71;opacity:1"></div>
+      <div id="bat-cell-3" style="flex:1;height:10px;border-radius:2px;background:#2ecc71;opacity:1"></div>
+    </div>
+    <div id="health-bar-wrap" style="position:relative;background:rgba(255,255,255,0.95);height:28px;border-radius:2px;margin-top:0;width:420px;box-shadow:0 3px 8px rgba(0,0,0,0.35);outline:1px solid rgba(0,0,0,0.25)">
+      <div id="health-bar" style="height:100%;width:100%;background:#d33;border-radius:2px;transform-origin:left;transition:width 0.08s linear"></div>
+      <div id="health-text" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);font-size:14px;color:#111;font-weight:800;text-shadow:0 1px 1px rgba(255,255,255,0.7)">100 / 100</div>
+    </div>
+  </div>
+  <script type="module">
+// game-5 urban step1: asphalt ground + roads, overcast mood
+(async function(){
+  let THREE;
+  try {
+    THREE = await import('./lib/three.module.js');
+  } catch(errModule){
+    console.warn('Local three.module.js import failed:', errModule);
+    const tryLoadLocalUMD = () => new Promise((resolve)=>{
+      const path = './lib/three.min.js';
+      const script = document.createElement('script');
+      script.src = path;
+      script.onload = () => resolve(window.THREE ? window.THREE : null);
+      script.onerror = () => resolve(null);
+      document.head.appendChild(script);
+      setTimeout(()=>{ resolve(window.THREE ? window.THREE : null); }, 1500);
+    });
+    const localUMD = await tryLoadLocalUMD();
+    if(localUMD){
+      THREE = localUMD;
+    } else {
+      console.warn('Local UMD not found or failed; falling back to CDN module');
+      THREE = await import('https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.module.js');
+    }
+  }
+  const { Scene, PerspectiveCamera, WebGLRenderer, Color, FogExp2, DirectionalLight, AmbientLight, HemisphereLight, PlaneGeometry, MeshStandardMaterial, Mesh, Vector3, CanvasTexture, CylinderGeometry, InstancedMesh, PointLight, BoxGeometry, BufferGeometry, Points, PointsMaterial, Group, ConeGeometry, MeshBasicMaterial, DoubleSide, ShaderMaterial } = THREE;
+
+  // scene & renderer (cyberpunk midnight)
+  const scene = new Scene();
+  const skyCol = new Color(0x04070c); // deeper near-black blue to make neon pop
+  scene.background = skyCol;
+  // thicker colored haze picking up magenta/blue neon scatter
+  scene.fog = new FogExp2(0x070912, 0.014);
+
+  const camera = new PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 6000);
+  camera.position.set(0, 1.6, 10);
+  // Predeclare interactables & pickup group early so spawners can run before later blocks initialize
+  const interactables = [];
+  const pickupGroup = new Group(); scene.add(pickupGroup);
+  // First-person arms (enhanced hands with fingers)
+  const armsGroup = new Group();
+  const armMat = new MeshStandardMaterial({ color: 0xcccccc, roughness: 0.9, metalness: 0.0 });
+  const upperGeo = new BoxGeometry(0.12, 0.36, 0.12);
+  const lowerGeo = new BoxGeometry(0.11, 0.34, 0.11);
+  const handGeo  = new BoxGeometry(0.16, 0.10, 0.20);
+  // fingered hand builder (uses helper fns defined later: makeLimbCyl, makePalmBox)
+  function buildFPHand(side='R', mat){
+    const handRoot = new Group();
+    const skinMat = (mat||armMat).clone();
+    // slight skin tint
+    skinMat.color = new Color(0xffd6bd);
+    skinMat.roughness = 0.8; skinMat.metalness = 0.0;
+    const palm = new Mesh(makePalmBox(0.16, 0.05, 0.18), skinMat);
+    handRoot.add(palm);
+    const isLeft = side === 'L';
+    const sgn = isLeft ? 1 : -1;
+    const bases = [
+      {x: sgn*0.038, z:-0.02, yaw: sgn*0.42}, // thumb (対立させるため大きめyaw)
+      {x: sgn*0.026, z: 0.00, yaw: 0.00},     // index
+      {x: sgn*0.000, z: 0.01, yaw: 0.00},     // middle
+      {x: sgn*-0.020, z: 0.00, yaw: 0.00},    // ring
+      {x: sgn*-0.036, z:-0.01, yaw: 0.00},    // little
+    ];
+    const fingers = [];
+  for(let i=0;i<5;i++){
+      const b = bases[i];
+      const base = new Group();
+      base.position.set(b.x, -0.015, 0.06 + b.z);
+      base.rotation.y = b.yaw;
+      handRoot.add(base);
+      const prox = new Mesh(makeLimbCyl(0.11, 0.035, 0.045), skinMat); base.add(prox);
+      const midG = new Group(); midG.position.set(0, -0.095, 0); base.add(midG);
+      const mid = new Mesh(makeLimbCyl(0.10, 0.03, 0.04), skinMat); midG.add(mid);
+      const tipG = new Group(); tipG.position.set(0, -0.085, 0); midG.add(tipG);
+  const tip = new Mesh(makeLimbCyl(0.09, 0.028, 0.035), skinMat); tipG.add(tip);
+  fingers.push({ base, midG, tipG, isThumb: i===0, baseYaw: b.yaw });
+    }
+    return { root: handRoot, fingers };
+  }
+  // Left arm (for flashlight)
+  const leftShoulder = new Group();
+  const leftUpper = new Mesh(upperGeo, armMat.clone());
+  const leftElbow = new Group();
+  const leftLower = new Mesh(lowerGeo, leftUpper.material);
+  const leftWrist = new Group();
+  // Left hand: switch to articulated hand group
+  const leftHand = new Group();
+  leftShoulder.add(leftUpper);
+  leftShoulder.position.set(-0.34, -0.30, -0.38);
+  leftUpper.position.set(0, -0.18, 0);
+  leftElbow.position.set(0, -0.36, 0);
+  leftUpper.add(leftElbow);
+  leftLower.position.set(0, -0.17, 0);
+  leftElbow.add(leftLower);
+  leftWrist.position.set(0, -0.34, 0.02);
+  leftElbow.add(leftWrist);
+  leftHand.position.set(-0.01, -0.06, 0.09);
+  leftWrist.add(leftHand);
+  let leftFingers = [];
+  {
+    const built = buildFPHand('L', leftUpper.material);
+    leftHand.add(built.root);
+    leftFingers = built.fingers;
+  }
+  armsGroup.add(leftShoulder);
+  // Flashlight holder (simple cylinder)
+  const flashlightGeo = new CylinderGeometry(0.04,0.05,0.22,12);
+  flashlightGeo.rotateZ(Math.PI/2);
+  const flashlightMat = new MeshStandardMaterial({ color:0x222222, metalness:0.4, roughness:0.6 });
+  const flashlightMesh = new Mesh(flashlightGeo, flashlightMat);
+  flashlightMesh.position.set(-0.02, -0.04, 0.14);
+  leftHand.add(flashlightMesh);
+  // Lights (spot + faint point)
+  const flashlightSpot = new THREE.SpotLight(0xffffff, 4.0, 18, Math.PI/10, 0.35, 1.0);
+  flashlightSpot.castShadow = true;
+  flashlightSpot.shadow.mapSize.set(512,512);
+  flashlightSpot.shadow.camera.near = 0.1;
+  flashlightSpot.shadow.camera.far = 30;
+  const flashlightPoint = new THREE.PointLight(0xffffff, 0.6, 2.4, 2.0);
+  flashlightSpot.position.set(0,0,0); flashlightPoint.position.set(0,0,0);
+  const flashlightTarget = new THREE.Object3D();
+  scene.add(flashlightTarget);
+  flashlightSpot.target = flashlightTarget;
+  flashlightMesh.add(flashlightSpot); flashlightMesh.add(flashlightPoint);
+  // Battery system
+  let batterySegments = 3; // current filled segments (0..3)
+  const batteryMaxSegments = 3;
+  let batteryDrainRate = 0.12; // segments per minute equivalent scaled inside loop
+  let batteryAccum = 0; // drains to reduce segments
+  const rightShoulder = new Group();
+  const rightUpper = new Mesh(upperGeo, armMat);
+  const rightElbow = new Group();
+  const rightLower = new Mesh(lowerGeo, armMat);
+  const rightWrist = new Group();
+  // Right hand: switch to articulated hand group
+  const rightHand  = new Group();
+  rightShoulder.add(rightUpper);
+  rightShoulder.position.set(0.32, -0.28, -0.36);
+  rightUpper.position.set(0, -0.18, 0);
+  rightElbow.position.set(0, -0.36, 0);
+  rightUpper.add(rightElbow);
+  rightLower.position.set(0, -0.17, 0);
+  rightElbow.add(rightLower);
+  rightWrist.position.set(0, -0.33, 0.02);
+  rightElbow.add(rightWrist);
+  rightHand.position.set(0.01, -0.06, 0.09);
+  rightWrist.add(rightHand);
+  let rightFingers = [];
+  {
+    const built = buildFPHand('R', armMat);
+    rightHand.add(built.root);
+    rightFingers = built.fingers;
+  }
+  armsGroup.add(rightShoulder);
+  armsGroup.rotation.x = -0.25; armsGroup.rotation.y = 0.15;
+  camera.add(armsGroup);
+  scene.add(camera);
+  let armBob = 0; let armReachT = 0;
+
+  const renderer = new WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled = true;
+  // push exposure slightly for vivid emissives; use ACES for cinematic rolloff if available
+  if(renderer.toneMapping !== undefined){
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.25;
+  }
+  document.body.appendChild(renderer.domElement);
+
+  // lights (cool ambient upper sky tint + warm ground bounce)
+  const hemi = new HemisphereLight(0x314e80, 0x120910, 0.32);
+  scene.add(hemi);
+  const sun = new DirectionalLight(0x4477bb, 0.18); // dim moon / skyline scatter
+  sun.position.set(-120, 160, -60);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(1024,1024);
+  sun.shadow.camera.near = 0.5; sun.shadow.camera.far = 600;
+  sun.shadow.camera.left = -200; sun.shadow.camera.right = 200; sun.shadow.camera.top = 200; sun.shadow.camera.bottom = -200;
+  scene.add(sun);
+  scene.add(new AmbientLight(0x18202c, 0.10));
+
+  // helpers: canvas textures
+  function makeNoiseCanvas(w=512, h=512, base=68, amp=14){
+    const c = document.createElement('canvas'); c.width=w; c.height=h;
+    const ctx = c.getContext('2d');
+    const img = ctx.createImageData(w,h);
+    const d = img.data;
+    for(let i=0;i<w*h;i++){
+      const n = base + Math.floor((Math.random()*2-1) * amp); // grey with noise
+      const o = i*4; d[o]=n; d[o+1]=n; d[o+2]=n; d[o+3]=255;
+    }
+    ctx.putImageData(img,0,0);
+    return c;
+  }
+  function makeAsphaltTexture(){
+    const base = makeNoiseCanvas(512,512,66,16);
+    const ctx = base.getContext('2d');
+    // add subtle darker blotches
+    ctx.fillStyle = 'rgba(0,0,0,0.08)';
+    for(let i=0;i<120;i++){
+      const x = Math.random()*512, y = Math.random()*512;
+      const r = 10 + Math.random()*40;
+      ctx.beginPath(); ctx.ellipse(x,y,r*1.2,r,0,0,Math.PI*2); ctx.fill();
+    }
+    const tex = new CanvasTexture(base);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.anisotropy = 4;
+    tex.needsUpdate = true;
+    return tex;
+  }
+  function makeRoughnessTexture(){
+    const base = makeNoiseCanvas(512,512,210,30); // brighter = rougher
+    const tex = new CanvasTexture(base);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.anisotropy = 4; tex.needsUpdate = true; return tex;
+  }
+  function makeRoadTexture({w=1024,h=512, lanes=2, dashed=true}={}){
+    const c = document.createElement('canvas'); c.width=w; c.height=h;
+    const ctx = c.getContext('2d');
+    // base asphalt
+    ctx.fillStyle = '#3e4246'; ctx.fillRect(0,0,w,h);
+    // sprinkle noise
+    const noise = makeNoiseCanvas(w,h,65,18);
+    ctx.globalAlpha = 0.35; ctx.drawImage(noise,0,0); ctx.globalAlpha = 1;
+    // edge lines
+    ctx.fillStyle = '#dfe7ee';
+    const edge = Math.floor(h*0.08);
+    ctx.fillRect(0, edge, w, Math.max(2, Math.floor(h*0.01)));
+    ctx.fillRect(0, h-edge, w, Math.max(2, Math.floor(h*0.01)));
+    // center lines
+    if(lanes>=2){
+      const lineY = Math.floor(h/2)-2;
+      ctx.fillStyle = '#e2c03b';
+      if(dashed){
+        const seg = 40, gap = 28;
+        for(let x=0;x<w;x+=seg+gap){ ctx.fillRect(x, lineY, seg, 4); }
+      } else {
+        ctx.fillRect(0, lineY, w, 4);
+      }
+    }
+    const tex = new CanvasTexture(c);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.anisotropy = 4; tex.needsUpdate = true; return tex;
+  }
+
+  // ground (flat with subtle micro undulation)
+  const terrainSize = 1000; // 1km x 1km (縮小して密度を濃くしつつパフォーマンス向上)
+  const segments = 200;
+  const planeGeo = new PlaneGeometry(terrainSize, terrainSize, segments, segments);
+  planeGeo.rotateX(-Math.PI/2);
+  // slight micro variation to break perfect flatness (<= 0.15m)
+  const pos = planeGeo.attributes.position;
+  for(let i=0;i<pos.count;i++){
+    const x = pos.getX(i), z = pos.getZ(i);
+    const n = Math.sin(x*0.08) * Math.cos(z*0.06) * 0.03 + (Math.random()*2-1)*0.02;
+    pos.setY(i, n*5.0); // up to ~0.15m
+  }
+  planeGeo.computeVertexNormals();
+  function sampleGroundHeight(){ return 0; } // flat baseline for collision target
+
+  const asphaltMap = makeAsphaltTexture(); asphaltMap.repeat.set(50,50); // 縮尺に合わせてタイル数調整
+  const roughMap = makeRoughnessTexture(); roughMap.repeat.set(50,50);
+  const groundMat = new MeshStandardMaterial({ color:0x2a2e33, map: asphaltMap, roughnessMap: roughMap, roughness: 1.0, metalness: 0.0 });
+  const ground = new Mesh(planeGeo, groundMat);
+  ground.receiveShadow = true; scene.add(ground);
+
+  // roads: two crossing planes forming an intersection
+  const roadTex = makeRoadTexture({w:1024,h:512,lanes:2,dashed:true});
+  roadTex.repeat.set(72,1); // scaled for long road
+  const roadMat = new MeshStandardMaterial({ map: roadTex, roughness: 0.95, metalness: 0.0 });
+  const roadA = new Mesh(new PlaneGeometry(980, 14, 1, 1), roadMat);
+  roadA.rotation.x = -Math.PI/2; roadA.position.y = 0.01; scene.add(roadA);
+  const roadB = new Mesh(new PlaneGeometry(14, 980, 1, 1), roadMat);
+  roadB.rotation.x = -Math.PI/2; roadB.position.y = 0.011; scene.add(roadB);
+
+  // decals: cracks and oil stains
+  function makeCrackTexture(w=512,h=256, branches=18){
+    const c = document.createElement('canvas'); c.width=w; c.height=h; const ctx=c.getContext('2d');
+    ctx.lineCap='round'; ctx.lineJoin='round';
+    for(let b=0;b<branches;b++){
+      let x = Math.random()*w, y = Math.random()*h;
+      let ang = Math.random()*Math.PI*2; let segs = 10 + Math.floor(Math.random()*20);
+      let thick = 1 + Math.random()*2;
+      ctx.beginPath(); ctx.moveTo(x,y);
+      for(let s=0;s<segs;s++){
+        ang += (Math.random()*2-1)*0.6; const len = 6 + Math.random()*18;
+        x += Math.cos(ang)*len; y += Math.sin(ang)*len;
+        ctx.lineWidth = thick * (1 - s/segs);
+        ctx.strokeStyle = 'rgba(10,10,10,0.55)'; ctx.lineTo(x,y); ctx.stroke();
+        // small offshoot
+        if(Math.random()<0.18){
+          const a2 = ang + (Math.random()*2-1)*1.2; const l2 = 4 + Math.random()*10;
+          ctx.beginPath(); ctx.moveTo(x,y); ctx.lineWidth = Math.max(0.6, ctx.lineWidth*0.6);
+          ctx.strokeStyle = 'rgba(10,10,10,0.45)'; ctx.lineTo(x+Math.cos(a2)*l2, y+Math.sin(a2)*l2); ctx.stroke();
+        }
+      }
+    }
+    const tex = new CanvasTexture(c); tex.needsUpdate = true; return tex;
+  }
+  function makeOilTexture(w=256,h=256, spots=8){
+    const c = document.createElement('canvas'); c.width=w; c.height=h; const ctx=c.getContext('2d');
+    for(let i=0;i<spots;i++){
+      const x = Math.random()*w, y = Math.random()*h; const r = 20 + Math.random()*60;
+      const g = ctx.createRadialGradient(x,y, r*0.1, x,y, r);
+      g.addColorStop(0, 'rgba(20,20,20,0.6)');
+      g.addColorStop(0.6, 'rgba(20,20,20,0.25)');
+      g.addColorStop(1, 'rgba(20,20,20,0.0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
+      // rainbow sheen hint
+      if(Math.random()<0.5){
+        ctx.globalCompositeOperation='lighter';
+        ctx.strokeStyle='rgba(160,120,220,0.08)'; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(x,y,r*0.65,0,Math.PI*2); ctx.stroke();
+        ctx.globalCompositeOperation='source-over';
+      }
+    }
+    const tex = new CanvasTexture(c); tex.needsUpdate = true; return tex;
+  }
+  function addDecal(tex, x, z, w=6, h=2, rot=0, opacity=1){
+    const mat = new MeshStandardMaterial({ map: tex, transparent: true, opacity, roughness: 0.95, metalness: 0.0 });
+    mat.depthWrite = false; mat.polygonOffset = true; mat.polygonOffsetFactor = -1; mat.polygonOffsetUnits = -1;
+    const g = new PlaneGeometry(w,h); const m = new Mesh(g, mat);
+    m.rotation.x = -Math.PI/2; m.rotation.z = rot; m.position.set(x, 0.02, z); // lifted slightly to avoid z-fight
+    scene.add(m); return m;
+  }
+  // place decals along roads
+  const crackTex = makeCrackTexture();
+  const oilTex = makeOilTexture();
+  // along x-road (z near 0)
+  for(let x=-1200; x<=1200; x+=30){
+    if(Math.random()<0.85) addDecal(crackTex, x + (Math.random()*6-3), (Math.random()*6-3), 8, 2.2, Math.random()*0.6-0.3, 0.95);
+    if(Math.random()<0.55) addDecal(oilTex, x + (Math.random()*6-3), (Math.random()*6-3), 3.2, 2.2, Math.random()*Math.PI, 0.85);
+  }
+  // along z-road (x near 0)
+  for(let z=-1200; z<=1200; z+=30){
+    if(Math.random()<0.85) addDecal(crackTex, (Math.random()*6-3), z + (Math.random()*6-3), 8, 2.2, Math.random()*0.6-0.3, 0.95);
+    if(Math.random()<0.55) addDecal(oilTex, (Math.random()*6-3), z + (Math.random()*6-3), 3.2, 2.2, Math.random()*Math.PI, 0.85);
+  }
+
+  // puddles (glossy dark planes)
+  function makePuddleTexture(w=256,h=256){
+    const c = document.createElement('canvas'); c.width=w; c.height=h; const ctx=c.getContext('2d');
+    const x=w/2, y=h/2, r=Math.min(w,h)*0.48;
+    const g = ctx.createRadialGradient(x,y, r*0.2, x,y, r);
+    g.addColorStop(0, 'rgba(30,36,44,0.8)');
+    g.addColorStop(1, 'rgba(30,36,44,0.0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.ellipse(x,y, r*1.0, r*0.7, 0, 0, Math.PI*2); ctx.fill();
+    return new CanvasTexture(c);
+  }
+  const puddleTex = makePuddleTexture();
+  function addPuddle(x,z, sx=4, sz=2.6, rot=0){
+    const mat = new MeshStandardMaterial({ map: puddleTex, color: 0x23262b, transparent: true, roughness: 0.12, metalness: 0.85, opacity: 0.95 });
+    mat.depthWrite = false; mat.polygonOffset = true; mat.polygonOffsetFactor = -1; mat.polygonOffsetUnits = -1;
+    const g = new PlaneGeometry(sx,sz); const m = new Mesh(g, mat);
+    m.rotation.x = -Math.PI/2; m.rotation.z = rot; m.position.set(x, 0.021, z); scene.add(m); return m;
+  }
+  for(let i=0;i<40;i++){
+    addPuddle((Math.random()*2-1)*480, (Math.random()*2-1)*6, 2.5+Math.random()*3, 1.6+Math.random()*2.0, Math.random()*0.6-0.3);
+    addPuddle((Math.random()*2-1)*6, (Math.random()*2-1)*480, 2.5+Math.random()*3, 1.6+Math.random()*2.0, Math.random()*0.6-0.3);
+  }
+
+  // far building silhouettes (low-cost instanced boxes)
+  const towerCount = 48; // 縮小マップ: 遠景タワー数を削減
+  const towerGeo = new BoxGeometry(1,1,1);
+  const towerMat = new MeshStandardMaterial({ color: 0x2a2e36, roughness: 1.0, metalness: 0.0 });
+  const towerInst = new InstancedMesh(towerGeo, towerMat, towerCount);
+  const tDummy = new THREE.Object3D();
+  for(let i=0;i<towerCount;i++){
+    const ang = Math.random()*Math.PI*2;
+  const dist = 520 + Math.random()*420; // 1km境界の内側〜境界付近
+    const bx = Math.cos(ang)*dist; const bz = Math.sin(ang)*dist;
+    const w = 6 + Math.random()*20; const d = 6 + Math.random()*20; const h = 30 + Math.random()*180;
+    tDummy.position.set(bx, h*0.5, bz);
+    tDummy.scale.set(w, h, d);
+    tDummy.rotation.y = Math.random()*Math.PI;
+    tDummy.updateMatrix(); towerInst.setMatrixAt(i, tDummy.matrix);
+  }
+  towerInst.instanceMatrix.needsUpdate = true; towerInst.castShadow = false; towerInst.receiveShadow = true; scene.add(towerInst);
+
+  // --- modular tower clusters (dense neon megastructures)
+  function makeFacadeTexture(w=256, h=512, warmBias=0.55){
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#10141b'; ctx.fillRect(0, 0, w, h);
+    const rows = 28; const cols = 14;
+    const warmPalette = ['#ff9a45', '#ff71c5', '#ffd362', '#ff5d91'];
+    const coolPalette = ['#42d9ff', '#67b8ff', '#8fe9ff', '#9fa7ff'];
+    for(let r=0;r<rows;r++){
+      for(let cIdx=0;cIdx<cols;cIdx++){
+        if(Math.random()<0.18) continue;
+        const cellW = w/cols; const cellH = h/rows;
+        const px = cIdx*cellW; const py = r*cellH;
+        const palette = (r/rows) < warmBias ? warmPalette : coolPalette;
+        const color = palette[Math.floor(Math.random()*palette.length)];
+        const ww = cellW * (0.42 + Math.random()*0.28);
+        const hh = cellH * (0.45 + Math.random()*0.25);
+        ctx.globalAlpha = 0.75 + Math.random()*0.2;
+        ctx.fillStyle = color;
+        ctx.fillRect(px + (cellW-ww)*0.5, py + (cellH-hh)*0.5, ww, hh);
+        if(Math.random()<0.12){
+          ctx.globalAlpha = 0.12 + Math.random()*0.15;
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(px + (cellW-ww)*0.5, py + hh*0.6, ww*0.9, hh*0.35);
+        }
+      }
+    }
+    const tex = new CanvasTexture(c);
+    tex.anisotropy = 2;
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.needsUpdate = true;
+    return tex;
+  }
+  const facadeTexWarm = makeFacadeTexture(256, 512, 0.55);
+  const facadeTexCool = makeFacadeTexture(256, 512, 0.35);
+  const podiumTemplate = new MeshStandardMaterial({ color: 0x1a2029, roughness: 0.6, metalness: 0.45 });
+  const towerTemplateWarm = new MeshStandardMaterial({ color: 0xffffff, map: facadeTexWarm, emissive: 0x141a2b, emissiveMap: facadeTexWarm, emissiveIntensity: 0.9, roughness: 0.78, metalness: 0.32 });
+  const towerTemplateCool = towerTemplateWarm.clone(); towerTemplateCool.map = facadeTexCool; towerTemplateCool.emissiveMap = facadeTexCool; towerTemplateCool.emissiveIntensity = 1.05;
+  const capTemplate = new MeshStandardMaterial({ color: 0x1b222e, emissive: 0x1c2f4b, emissiveIntensity: 0.6, roughness: 0.66, metalness: 0.4 });
+  const spireTemplate = new MeshStandardMaterial({ color: 0x252f3c, emissive: 0x3462ff, emissiveIntensity: 0.7, roughness: 0.5, metalness: 0.65 });
+  const neonStripBase = new MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85, depthWrite: false, blending: THREE.AdditiveBlending, side: DoubleSide });
+  const neonPalette = [0x33c8ff, 0xff3fa8, 0x3dff7a, 0xffef55, 0x8f4dff, 0xff2e55, 0x66ffee, 0xffa3d6];
+
+  const unitBox = new BoxGeometry(1,1,1);
+  const stripGeo = new PlaneGeometry(1,1);
+  const spireGeo = new CylinderGeometry(0.35, 0.6, 4, 8);
+
+  const towerGroup = new Group(); scene.add(towerGroup);
+  const bridgeGroup = new Group(); scene.add(bridgeGroup);
+  const cityTowers = [];
+  const skybridges = [];
+
+  function cloneMatWithJitter(base, lightJitter=0){
+    const mat = base.clone();
+    if(lightJitter !== 0) mat.color.offsetHSL(0, 0, lightJitter);
+    if(mat.emissiveIntensity !== undefined){ mat.emissiveIntensity *= 0.85 + Math.random()*0.3; }
+    mat.roughness = Math.min(1.0, Math.max(0.1, mat.roughness * (0.9 + Math.random()*0.2)));
+    mat.metalness = Math.min(1.0, Math.max(0.0, mat.metalness * (0.9 + Math.random()*0.2)));
+    return mat;
+  }
+
+  function createCompositeTower(x, z, heightBias=1.0){
+    const group = new Group();
+    group.position.set(x, 0, z);
+    towerGroup.add(group);
+
+    const baseW = (12 + Math.random()*18) * (0.75 + heightBias*0.4);
+    const baseD = (12 + Math.random()*18) * (0.75 + heightBias*0.4);
+    const podiumH = 6 + Math.random()*10;
+    const podium = new Mesh(unitBox, cloneMatWithJitter(podiumTemplate, (Math.random()*0.1)-0.05));
+    podium.scale.set(baseW, podiumH, baseD);
+    podium.position.y = podiumH*0.5;
+    group.add(podium);
+
+    let currentY = podiumH;
+    let width = baseW * (0.82 + Math.random()*0.12);
+    let depth = baseD * (0.82 + Math.random()*0.12);
+    const segmentCount = 3 + Math.floor(Math.random()*2);
+    const anchors = [];
+    let totalHeight = currentY;
+    const facadeTemplate = (Math.random()<0.55 ? towerTemplateWarm : towerTemplateCool);
+    for(let s=0; s<segmentCount; s++){
+      const heightMul = 0.65 + heightBias*0.45;
+      const segH = (18 + Math.random()*16) * heightMul * (1 - s*0.08);
+      const segment = new Mesh(unitBox, cloneMatWithJitter(facadeTemplate, (Math.random()*0.06)-0.03));
+      segment.scale.set(width, segH, depth);
+      segment.position.y = currentY + segH*0.5;
+      group.add(segment);
+      const anchorTop = segment.position.y + segH*0.25;
+      if(anchorTop > 12) anchors.push(anchorTop);
+      currentY += segH;
+      totalHeight = currentY;
+      width *= 0.78 + Math.random()*0.14;
+      depth *= 0.78 + Math.random()*0.14;
+    }
+
+    const capH = (12 + Math.random()*18) * (0.5 + heightBias*0.4);
+    const cap = new Mesh(unitBox, cloneMatWithJitter(capTemplate, (Math.random()*0.08)-0.04));
+    cap.scale.set(width*0.92, capH, depth*0.92);
+    cap.position.y = currentY + capH*0.5;
+    group.add(cap);
+    let topY = cap.position.y + capH*0.5;
+    anchors.push(cap.position.y + capH*0.3);
+
+    if(Math.random()<0.75){
+      const spireH = 8 + Math.random()*20;
+      const spire = new Mesh(spireGeo, cloneMatWithJitter(spireTemplate, (Math.random()*0.06)-0.03));
+      spire.scale.set(1 + Math.random()*0.6, spireH, 1 + Math.random()*0.6);
+      spire.position.y = cap.position.y + capH*0.5 + spireH*0.5;
+      group.add(spire);
+      topY = spire.position.y + spireH*0.5;
+      anchors.push(spire.position.y - spireH*0.35);
+    }
+
+    const totalRadius = Math.max(baseW, baseD) * 0.58;
+    const totalHeightRef = topY;
+    const stripCount = 2 + Math.floor(Math.random()*3);
+    for(let n=0;n<stripCount;n++){
+      const stripMat = neonStripBase.clone();
+      stripMat.color = new Color(neonPalette[Math.floor(Math.random()*neonPalette.length)]);
+      stripMat.opacity = 0.7 + Math.random()*0.25;
+      const strip = new Mesh(stripGeo, stripMat);
+      strip.scale.set(Math.max(0.8, baseW*0.14), totalHeightRef*0.92, 1);
+      strip.position.y = totalHeightRef*0.5;
+      const face = Math.floor(Math.random()*4);
+      switch(face){
+        case 0: strip.position.z = depth*0.5 + 0.14; break;
+        case 1: strip.position.z = -depth*0.5 - 0.14; break;
+        case 2: strip.position.x = width*0.5 + 0.14; strip.rotation.y = Math.PI/2; break;
+        default: strip.position.x = -width*0.5 - 0.14; strip.rotation.y = Math.PI/2; break;
+      }
+      group.add(strip);
+    }
+
+    anchors.sort((a,b)=>a-b);
+    const anchorHeights = anchors.filter((_,idx)=>idx >= anchors.length-3);
+
+    const info = { group, x, z, radius: totalRadius, height: totalHeightRef, anchors: anchorHeights };
+    cityTowers.push(info);
+    return info;
+  }
+
+  function canPlaceTower(x, z, minDist){
+    for(let i=0;i<cityTowers.length;i++){
+      const t = cityTowers[i];
+      const dx = t.x - x; const dz = t.z - z;
+      if(dx*dx + dz*dz < minDist*minDist) return false;
+    }
+    return true;
+  }
+
+  function spawnTowerCluster(cx, cz, radius, count, bias){
+    for(let i=0;i<count;i++){
+      let placed = false;
+      for(let attempt=0; attempt<8 && !placed; attempt++){
+        const ang = Math.random()*Math.PI*2;
+        const r = Math.sqrt(Math.random()) * radius;
+        const x = cx + Math.cos(ang)*r + (Math.random()*24 - 12);
+        const z = cz + Math.sin(ang)*r + (Math.random()*24 - 12);
+        if(Math.abs(x) > 480 || Math.abs(z) > 480) continue;
+        if(!canPlaceTower(x, z, 28)) continue;
+        createCompositeTower(x, z, bias);
+        placed = true;
+      }
+    }
+  }
+
+  spawnTowerCluster(0, 0, 190, 46, 1.25);
+  spawnTowerCluster(210, 90, 150, 26, 1.05);
+  spawnTowerCluster(-220, 110, 150, 26, 1.1);
+  spawnTowerCluster(170, -210, 140, 24, 0.95);
+  spawnTowerCluster(-230, -170, 150, 24, 0.95);
+  spawnTowerCluster(0, 240, 130, 18, 0.85);
+  spawnTowerCluster(0, -240, 130, 18, 0.85);
+
+  function chooseBridgeAnchor(a, b){
+    let best = null; let bestDiff = Infinity;
+    for(let i=0;i<a.anchors.length;i++){
+      for(let j=0;j<b.anchors.length;j++){
+        const diff = Math.abs(a.anchors[i] - b.anchors[j]);
+        if(diff < bestDiff){
+          bestDiff = diff;
+          best = { height: (a.anchors[i] + b.anchors[j]) * 0.5 };
+        }
+      }
+    }
+    return (best && bestDiff < 14) ? best : null;
+  }
+
+  const bridgeDeckMat = new MeshStandardMaterial({ color: 0x1b2836, emissive: 0x12324e, emissiveIntensity: 0.48, roughness: 0.55, metalness: 0.6 });
+  const bridgeConnectionCounts = new Array(cityTowers.length).fill(0);
+  const bridgeDir = new Vector3();
+  const bridgeMid = new Vector3();
+
+  for(let i=0;i<cityTowers.length;i++){
+    for(let j=i+1;j<cityTowers.length;j++){
+      if(bridgeConnectionCounts[i] >= 3 || bridgeConnectionCounts[j] >= 3) continue;
+      const a = cityTowers[i]; const b = cityTowers[j];
+      const dx = b.x - a.x; const dz = b.z - a.z;
+      const dist = Math.sqrt(dx*dx + dz*dz);
+      if(dist < 38 || dist > 170) continue;
+      if(Math.random() > 0.55) continue;
+      const anchor = chooseBridgeAnchor(a, b);
+      if(!anchor) continue;
+      const length = dist - (a.radius + b.radius) * 0.65;
+      if(length <= 6) continue;
+      const width = 4.2 + Math.random()*1.8;
+      bridgeMid.set((a.x + b.x)*0.5, anchor.height, (a.z + b.z)*0.5);
+      const walkway = new Group();
+      walkway.position.copy(bridgeMid);
+      bridgeDir.set(dx, 0, dz).normalize();
+      const quat = new THREE.Quaternion().setFromUnitVectors(new Vector3(0,0,1), bridgeDir);
+      walkway.setRotationFromQuaternion(quat);
+      const deck = new Mesh(unitBox, cloneMatWithJitter(bridgeDeckMat, (Math.random()*0.04)-0.02));
+      deck.scale.set(width, 1.1, length);
+      walkway.add(deck);
+      const railColor = neonPalette[Math.floor(Math.random()*neonPalette.length)];
+      for(const side of [-1, 1]){
+        const railMat = new MeshBasicMaterial({ color: railColor, transparent: true, opacity: 0.75, depthWrite: false, blending: THREE.AdditiveBlending });
+        const rail = new Mesh(unitBox, railMat);
+        rail.scale.set(length, 0.25, 0.18);
+        rail.position.set(0, 0.8, side*(width*0.5 + 0.1));
+        walkway.add(rail);
+      }
+      bridgeGroup.add(walkway);
+      skybridges.push({ ax: a.x, az: a.z, bx: b.x, bz: b.z, height: anchor.height });
+      bridgeConnectionCounts[i]++; bridgeConnectionCounts[j]++;
+    }
+  }
+
+  // --- neon signs with intermittent flicker and sparks
+  const neonGroup = new Group(); scene.add(neonGroup);
+  const neonMeshes = []; const neonCtrl = [];
+  function addNeon(x, z, w=3.2, h=1.0, color=0x66e0ff){
+    const geo = new PlaneGeometry(w, h);
+    // dark backing + high emissive for punchy neon; slight metallic to catch specular rain
+    const mat = new MeshStandardMaterial({ color: 0x060606, emissive: color, emissiveIntensity: 0.4, roughness: 0.82, metalness: 0.15 });
+    const m = new Mesh(geo, mat); m.rotation.x = -Math.PI/2; m.rotation.z = Math.random()*Math.PI; // lay as if panel oriented randomly near ground
+    // raise slightly to be visible above ground; tilt a bit
+    m.position.set(x, 0.03, z); m.rotation.x = -Math.PI/2 + (Math.random()*2-1)*0.15;
+    neonGroup.add(m);
+    neonMeshes.push(m);
+  // per-panel flicker profile and an optional point light to bleed color into scene
+  const light = new PointLight(color, 0.0, 12, 2.0); light.position.set(x, 1.0, z); scene.add(light);
+  neonCtrl.push({ base: 2.2 + Math.random()*3.0, speed: 2.0 + Math.random()*3.0, jitter: Math.random()*Math.PI*2, offProb: 0.04 + Math.random()*0.05, nextSpark: 0, light });
+  }
+  // distribute some neons near roads
+  const neonColors = neonPalette;
+  for(let i=0;i<12;i++){
+    // along x-road and z-road edges
+    const onX = Math.random()<0.5;
+    const col = neonColors[Math.floor(Math.random()*neonColors.length)];
+  if(onX){ addNeon((Math.random()*2-1)*480, (Math.random()<0.5? 9.0 : -9.0) + (Math.random()*2-1)*3, 3+Math.random()*2, 0.8+Math.random()*0.6, col); }
+  else { addNeon((Math.random()<0.5? 9.0 : -9.0) + (Math.random()*2-1)*3, (Math.random()*2-1)*480, 3+Math.random()*2, 0.8+Math.random()*0.6, col); }
+  }
+
+  // spark particle system (multiple ephemeral bursts)
+  const sparkBursts = [];
+  function spawnSparkParticles(pos){
+    const count = 20;
+    const g = new BufferGeometry();
+    const positions = new Float32Array(count*3);
+    const velocities = new Float32Array(count*3);
+    for(let i=0;i<count;i++){
+      const ix = i*3;
+      positions[ix+0] = pos.x; positions[ix+1] = pos.y + 0.1; positions[ix+2] = pos.z;
+      const a = Math.random()*Math.PI*2; const up = Math.random()*0.9 + 0.2;
+      const sp = 3.0 + Math.random()*4.0;
+      velocities[ix+0] = Math.cos(a)*sp*0.5; velocities[ix+1] = up*sp; velocities[ix+2] = Math.sin(a)*sp*0.5;
+    }
+    g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    g.setAttribute('velocity', new THREE.Float32BufferAttribute(velocities, 3));
+    const m = new PointsMaterial({ color: 0xfff2a8, size: 0.08, transparent: true, opacity: 1.0, depthWrite:false });
+    const p = new Points(g, m); p.userData.life = 0.25 + Math.random()*0.25; p.userData.age = 0;
+    scene.add(p); sparkBursts.push(p);
+  }
+
+  // --- wrecked cars (low-poly)
+  const carGroup = new Group(); scene.add(carGroup);
+  // shared geometries/materials
+  const gCarBody = new BoxGeometry(3.6, 1.2, 1.6); gCarBody.translate(0, 0.6, 0);
+  const gCarCab = new BoxGeometry(2.0, 0.9, 1.5); gCarCab.translate(-0.2, 1.35, 0);
+  const gWheel = new CylinderGeometry(0.36, 0.36, 0.4, 16); gWheel.rotateZ(Math.PI/2);
+  const matMetal = new MeshStandardMaterial({ color: 0x4a4d50, roughness: 0.9, metalness: 0.2 });
+  const matPaints = [0x5a6a77,0x7a3b3b,0x3d5a3d,0x6a5a3d,0x3a3f6a].map(c=>new MeshStandardMaterial({ color:c, roughness:0.85, metalness:0.3 }));
+  const matGlass = new MeshStandardMaterial({ color: 0x88a0b5, roughness: 0.2, metalness: 0.0, transparent:true, opacity:0.5 });
+  const matTire = new MeshStandardMaterial({ color: 0x1a1a1a, roughness: 1.0, metalness: 0.0 });
+  function makeCar(){
+    const g = new Group();
+    const body = new Mesh(gCarBody, matPaints[Math.floor(Math.random()*matPaints.length)]);
+    const cab = new Mesh(gCarCab, matGlass);
+    const wheelPositions = [
+      [ 1.3, 0.36,  0.8], [ 1.3, 0.36, -0.8],
+      [-1.3, 0.36,  0.8], [-1.3, 0.36, -0.8]
+    ];
+    const wheels = wheelPositions.map(p=>{ const w=new Mesh(gWheel, matTire); w.position.set(p[0],p[1],p[2]); return w; });
+    // damage: chance to miss a wheel or tilt
+    wheels.forEach((w,idx)=>{ if(Math.random()<0.18){ w.scale.set(0.001,0.001,0.001); w.visible=false; } });
+    g.add(body, cab, ...wheels);
+    // slight dents by random rotations and scales
+    g.rotation.y = (Math.random()*2-1)*Math.PI;
+    g.rotation.z = (Math.random()*2-1)*0.06;
+    g.position.y = 0.02;
+    const s = 0.95 + Math.random()*0.15; g.scale.set(s,s,s);
+    return g;
+  }
+  function spawnCarsAlongRoads(count=28){
+    let c=0;
+    while(c<count){
+      const onX = Math.random()<0.5;
+      const pos = new Vector3();
+      if(onX){
+        pos.x = (Math.random()*2-1)*1200; pos.z = (Math.random()<0.5? 3.6 : -3.6) + (Math.random()*2-1)*1.2;
+      } else {
+        pos.z = (Math.random()*2-1)*1200; pos.x = (Math.random()<0.5? 3.6 : -3.6) + (Math.random()*2-1)*1.2;
+      }
+      const car = makeCar(); car.position.add(pos);
+      // chance to be heavily wrecked (on side)
+      if(Math.random()<0.2){ car.rotation.x = (Math.random()*2-1)*0.9; car.rotation.z = (Math.random()*2-1)*0.6; }
+      carGroup.add(car); c++;
+    }
+  }
+  spawnCarsAlongRoads(30);
+
+  // --- fallen/tilted billboards
+  const signGroup = new Group(); scene.add(signGroup);
+  const gPost = new CylinderGeometry(0.18,0.22,5.2,10); gPost.translate(0,2.6,0);
+  const gBoard = new BoxGeometry(6.0,3.0,0.12); gBoard.translate(0,1.6,0);
+  const matPost = new MeshStandardMaterial({ color:0x666a6f, roughness:0.95, metalness:0.05 });
+  function makePosterTexture(w=512,h=256){
+    const c = document.createElement('canvas'); c.width=w; c.height=h; const ctx = c.getContext('2d');
+    ctx.fillStyle = '#2b2f36'; ctx.fillRect(0,0,w,h);
+    // fake torn edges
+    ctx.fillStyle = 'rgba(240,240,240,0.9)';
+    ctx.fillRect(12,12,w-24,h-24);
+    ctx.globalCompositeOperation='destination-out';
+    for(let i=0;i<28;i++){
+      const rx = 12 + Math.random()*(w-24); const ry = 12 + Math.random()*(h-24);
+      ctx.beginPath(); ctx.arc(rx, ry, 6+Math.random()*22, 0, Math.PI*2); ctx.fill();
+    }
+    ctx.globalCompositeOperation='source-over';
+    ctx.fillStyle = 'rgba(180,40,40,0.85)'; ctx.font = 'bold 56px Segoe UI'; ctx.fillText('SALE 90% OFF', 28, h/2+16);
+    return new CanvasTexture(c);
+  }
+  const posterTex = makePosterTexture();
+  const matBoard = new MeshStandardMaterial({ map: posterTex, roughness:0.9, metalness:0.0 });
+  function makeBillboard(){
+    const g = new Group();
+    const post = new Mesh(gPost, matPost);
+    const board = new Mesh(gBoard, matBoard);
+    g.add(post, board);
+    // random tilt or completely fallen
+    if(Math.random()<0.35){
+      // fallen: lay on ground
+      g.rotation.x = -Math.PI/2 * (0.9 + Math.random()*0.2);
+      g.position.y = 0.02;
+    } else {
+      g.rotation.z = (Math.random()*2-1)*0.4;
+      g.position.y = 0.02;
+    }
+    return g;
+  }
+  function spawnBillboards(n=12){
+    for(let i=0;i<n;i++){
+      const onX = Math.random()<0.5; const b = makeBillboard();
+  if(onX){ b.position.x = (Math.random()*2-1)*480; b.position.z = (Math.random()<0.5? 10.5 : -10.5) + (Math.random()*2-1)*4; }
+  else { b.position.z = (Math.random()*2-1)*480; b.position.x = (Math.random()<0.5? 10.5 : -10.5) + (Math.random()*2-1)*4; }
+      b.rotation.y = Math.random()*Math.PI;
+      signGroup.add(b);
+    }
+  }
+  spawnBillboards(14);
+
+  // --- distant skyline ring (emissive window towers beyond map bounds)
+  function makeWindowTextureFar(w=256,h=512){
+    const c=document.createElement('canvas'); c.width=w; c.height=h; const ctx=c.getContext('2d');
+    // base facade
+    ctx.fillStyle='#0d1018'; ctx.fillRect(0,0,w,h);
+    // window grid
+    const cols= Math.floor(w/8), rows=Math.floor(h/10);
+    const colors=['#33c8ff','#ff3fa8','#ffef55','#8f4dff','#66ffee','#ffa3d6'];
+    for(let r=2;r<rows-2;r++){
+      for(let col=1;col<cols-1;col++){
+        if(Math.random()<0.18){
+          const x=col*8 + (Math.random()*2-1)*1;
+          const y=r*10 + (Math.random()*2-1)*1;
+          const cw=5+Math.random()*2, ch=6+Math.random()*2;
+          ctx.globalAlpha=0.9; ctx.fillStyle=colors[(Math.random()*colors.length)|0];
+          ctx.fillRect(x,y,cw,ch);
+        } else if(Math.random()<0.06){
+          // off but faint interior glow
+          const x=col*8, y=r*10; ctx.globalAlpha=0.08; ctx.fillStyle='#8aa'; ctx.fillRect(x+1,y+1,4,5);
+        }
+      }
+    }
+    return new CanvasTexture(c);
+  }
+  const winTexFar = makeWindowTextureFar();
+  const skyGeo = new BoxGeometry(1,1,1);
+  const skyMat = new MeshStandardMaterial({ color: 0x0e1016, roughness: 1.0, metalness: 0.0, emissive: 0xffffff, emissiveMap: winTexFar, emissiveIntensity: 0.9 });
+  const skylineCount = 160;
+  const skylineInst = new InstancedMesh(skyGeo, skyMat, skylineCount); scene.add(skylineInst);
+  const skyDummy = new THREE.Object3D();
+  const ringR1 = 560, ringR2 = 880; let si=0;
+  for(let k=0;k<skylineCount;k++){
+    const ang = (k/skylineCount)*Math.PI*2 + Math.random()*0.06;
+    const r = ringR1 + Math.random()*(ringR2-ringR1);
+    const x = Math.cos(ang)*r; const z = Math.sin(ang)*r;
+    const w = 8 + Math.random()*20; const d = 8 + Math.random()*20; const h = 60 + Math.random()*180;
+    skyDummy.position.set(x, h*0.5, z);
+    skyDummy.scale.set(w, h, d);
+    skyDummy.rotation.y = -ang + (Math.random()*2-1)*0.2; // roughly face toward center
+    skyDummy.updateMatrix(); skylineInst.setMatrixAt(si++, skyDummy.matrix);
+  }
+  skylineInst.count = si; skylineInst.instanceMatrix.needsUpdate = true;
+
+  // --- low-lying colored fog sheets for extra neon haze
+  function makeFogSheetTexture(w=256,h=256){
+    const c=document.createElement('canvas'); c.width=w; c.height=h; const ctx=c.getContext('2d');
+    const g=ctx.createLinearGradient(0,0,0,h);
+    g.addColorStop(0,'rgba(0,0,0,0)');
+    g.addColorStop(0.35,'rgba(120,150,255,0.10)');
+    g.addColorStop(0.75,'rgba(255,100,200,0.18)');
+    g.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=g; ctx.fillRect(0,0,w,h);
+    return new CanvasTexture(c);
+  }
+  const fogTex = makeFogSheetTexture();
+  const fogSheets = []; const fogGroup = new Group(); scene.add(fogGroup);
+  function addFogSheet(x,z,w=420,h=120,rot=0){
+    const geo=new PlaneGeometry(w,h); const mat=new MeshBasicMaterial({ map:fogTex, transparent:true, opacity:0.8, depthWrite:false, blending:THREE.AdditiveBlending, side:DoubleSide });
+    const m=new Mesh(geo,mat); m.position.set(x, h*0.5*0.2 + 0.6, z); m.rotation.y = rot; // stand vertical
+    fogGroup.add(m); fogSheets.push({ m, dir:(Math.random()*2-1)*0.2 });
+  }
+  for(let i=0;i<8;i++){
+    const onX = Math.random()<0.5;
+    if(onX) addFogSheet((Math.random()*2-1)*380, (Math.random()<0.5?-1:1)*60 + (Math.random()*2-1)*120, 420+Math.random()*200, 120+Math.random()*80, Math.random()*0.3-0.15);
+    else addFogSheet((Math.random()<0.5?-1:1)*60 + (Math.random()*2-1)*120, (Math.random()*2-1)*380, 420+Math.random()*200, 120+Math.random()*80, Math.random()*0.3-0.15);
+  }
+  // (rain removed per request)
+
+  // --- guardrails along road edges (posts + rails)
+  const guardPostGeo = new CylinderGeometry(0.08, 0.08, 1.1, 12);
+  guardPostGeo.translate(0, 0.55, 0);
+  const guardRailGeo = new BoxGeometry(3.0, 0.14, 0.15);
+  guardRailGeo.translate(0, 0.95, 0); // rail height above ground
+  const guardMat = new MeshStandardMaterial({ color: 0xaab0b6, roughness: 0.85, metalness: 0.15 });
+  // layout along long roads: offset from road edges by ~2.5m
+  const railSpan = 3.0; // horizontal span per rail segment
+  const sectionLen = 490; // half-length along each road (1km マップに合わせる)
+  // compute counts
+  const railCountPerSide = Math.floor((sectionLen*2) / railSpan);
+  const postSpacing = 3.0;
+  const postCountPerSide = Math.floor((sectionLen*2) / postSpacing) + 1;
+  const sides = [ // [axis, fixedCoord, offsetOutward]
+    { axis:'x', z:  10.0 },
+    { axis:'x', z: -10.0 },
+    { axis:'z', x:  10.0 },
+    { axis:'z', x: -10.0 },
+  ];
+  const totalPosts = postCountPerSide * sides.length;
+  const totalRails = railCountPerSide * sides.length;
+  const postInst = new InstancedMesh(guardPostGeo, guardMat, totalPosts);
+  const railInst = new InstancedMesh(guardRailGeo, guardMat, totalRails);
+  postInst.castShadow = true; postInst.receiveShadow = true;
+  railInst.castShadow = true; railInst.receiveShadow = true;
+  scene.add(postInst); scene.add(railInst);
+  const tmp = new THREE.Object3D();
+  let pi = 0, ri = 0;
+  sides.forEach(side=>{
+    // posts
+    for(let i=0;i<postCountPerSide;i++){
+      const t = -sectionLen + i*postSpacing;
+      const broken = Math.random()<0.07; // missing post
+      tmp.rotation.set(0,0,0);
+      if(side.axis==='x'){
+        tmp.position.set(t, 0.02, side.z);
+        tmp.rotation.y = (Math.random()*2-1)*0.06;
+      } else {
+        tmp.position.set(side.x, 0.02, t);
+        tmp.rotation.y = (Math.random()*2-1)*0.06;
+      }
+      // tilt variation
+      tmp.rotation.z = (Math.random()*2-1)*0.06;
+      tmp.updateMatrix();
+      if(!broken){ postInst.setMatrixAt(pi++, tmp.matrix); }
+    }
+    // rails
+    for(let i=0;i<railCountPerSide;i++){
+      const t = -sectionLen + i*railSpan + railSpan*0.5;
+      const broken = Math.random()<0.12; // missing rail
+      tmp.rotation.set(0,0,0);
+      if(side.axis==='x'){
+        tmp.position.set(t, 0.02, side.z);
+        tmp.rotation.y = 0;
+      } else {
+        tmp.position.set(side.x, 0.02, t);
+        tmp.rotation.y = Math.PI/2;
+      }
+      // slight vertical variance to look bent
+      tmp.position.y += (Math.random()*2-1)*0.04;
+      // occasional heavy bend
+      if(Math.random()<0.08){ tmp.rotation.z = (Math.random()*2-1)*0.25; }
+      tmp.updateMatrix();
+      if(!broken){ railInst.setMatrixAt(ri++, tmp.matrix); }
+    }
+  });
+  postInst.count = pi; postInst.instanceMatrix.needsUpdate = true;
+  railInst.count = ri; railInst.instanceMatrix.needsUpdate = true;
+
+  // --- traffic cones (body + base instanced)
+  const coneCount = 120;
+  const coneBodyGeo = new ConeGeometry(0.32, 0.7, 24);
+  coneBodyGeo.translate(0, 0.35, 0);
+  const coneBaseGeo = new CylinderGeometry(0.36, 0.36, 0.06, 20);
+  coneBaseGeo.translate(0, 0.03, 0);
+  const coneMat = new MeshStandardMaterial({ color: 0xd96a1a, roughness: 0.9, metalness: 0.05 });
+  const coneBaseMat = new MeshStandardMaterial({ color: 0x333333, roughness: 1.0, metalness: 0.0 });
+  const coneInst = new InstancedMesh(coneBodyGeo, coneMat, coneCount);
+  const coneBaseInst = new InstancedMesh(coneBaseGeo, coneBaseMat, coneCount);
+  coneInst.castShadow = true; coneInst.receiveShadow = true; coneBaseInst.castShadow = true; coneBaseInst.receiveShadow = true;
+  scene.add(coneInst); scene.add(coneBaseInst);
+  let ci = 0; const cDummy = new THREE.Object3D();
+  function placeCone(x,z){
+    cDummy.position.set(x, 0.02, z);
+    cDummy.rotation.y = Math.random()*Math.PI*2;
+    cDummy.rotation.z = (Math.random()*2-1)*0.12;
+    const s = 0.9 + Math.random()*0.25; cDummy.scale.set(s,s,s);
+    cDummy.updateMatrix();
+    coneInst.setMatrixAt(ci, cDummy.matrix);
+    coneBaseInst.setMatrixAt(ci, cDummy.matrix);
+    ci++;
+  }
+  // scatter cones near intersection and random road segments
+  for(let i=0;i<40;i++){
+    placeCone((Math.random()*2-1)*12, (Math.random()*2-1)*12);
+  }
+  for(let i=0;i<40;i++){
+  placeCone((Math.random()*2-1)*480, (Math.random()<0.5? 6.5 : -6.5) + (Math.random()*2-1)*3);
+  }
+  for(let i=0;i<40;i++){
+  placeCone((Math.random()<0.5? 6.5 : -6.5) + (Math.random()*2-1)*3, (Math.random()*2-1)*480);
+  }
+  coneInst.count = ci; coneBaseInst.count = ci;
+  coneInst.instanceMatrix.needsUpdate = true; coneBaseInst.instanceMatrix.needsUpdate = true;
+
+  // streetlights (poles instanced + point lights + small emissive heads)
+  const lampPositions = [];
+  // along roadA (x-axis road), place rows at z=±7
+  for(let x=-480; x<=480; x+=40){ lampPositions.push(new Vector3(x,0,7)); lampPositions.push(new Vector3(x,0,-7)); }
+  // along roadB (z-axis road), place rows at x=±7
+  for(let z=-480; z<=480; z+=40){ lampPositions.push(new Vector3(7,0,z)); lampPositions.push(new Vector3(-7,0,z)); }
+  const poleGeo = new CylinderGeometry(0.08, 0.1, 5.2, 10);
+  poleGeo.translate(0, 2.6, 0);
+  const poleMat = new MeshStandardMaterial({ color: 0x6b6f75, roughness: 0.9, metalness: 0.05 });
+  const poleInst = new InstancedMesh(poleGeo, poleMat, lampPositions.length);
+  poleInst.castShadow = false; poleInst.receiveShadow = true; scene.add(poleInst);
+  const lampLights = []; const lampMeshes = []; const lampFlick = [];
+  const lampHeadGeo = new BoxGeometry(0.36,0.18,0.36);
+  const lampHeadMat = new MeshStandardMaterial({ color: 0x111111, emissive: 0x99bbff, emissiveIntensity: 1.0, roughness: 0.6, metalness: 0.0 });
+  const dummyObj = new THREE.Object3D();
+  lampPositions.forEach((p, i)=>{
+    // offset from ground (y from flat base)
+    const baseY = 0; // ground baseline
+    dummyObj.position.set(p.x, baseY, p.z);
+    // small lateral offset outward from road center
+    if (Math.abs(p.z) > 0) dummyObj.position.z += (p.z>0? 1.0 : -1.0);
+    if (Math.abs(p.x) > 0 && Math.abs(p.z) < 0.001) dummyObj.position.x += (p.x>0? 1.0 : -1.0);
+    dummyObj.rotation.set(0, 0, 0);
+    dummyObj.updateMatrix();
+    poleInst.setMatrixAt(i, dummyObj.matrix);
+    // lamp head mesh
+    const head = new Mesh(lampHeadGeo, lampHeadMat.clone());
+    head.position.set(dummyObj.position.x, baseY + 5.1, dummyObj.position.z);
+    head.castShadow = false; head.receiveShadow = false; scene.add(head); lampMeshes.push(head);
+    // point light for emission
+  const warm = new PointLight(0x99bbff, 3.0, 16, 2.0);
+    warm.position.set(head.position.x, head.position.y - 0.05, head.position.z);
+  // disable shadows to avoid exceeding sampler limits with many lights
+  warm.castShadow = false; scene.add(warm); lampLights.push(warm);
+    // flicker parameters
+    lampFlick.push({ base: 3.2, speed: 2.0 + Math.random()*1.5, jitter: Math.random()*Math.PI*2, offProb: 0.08 + Math.random()*0.08 });
+  });
+  poleInst.instanceMatrix.needsUpdate = true;
+
+  // utility poles with intermittent arcing light
+  const poleGroup = new THREE.Group(); scene.add(poleGroup);
+  const utilPoles = []; // {mesh, head, light, ctrl}
+  (function spawnUtilityPoles(){
+    const poleGeo = new CylinderGeometry(0.16, 0.2, 7.0, 12); poleGeo.translate(0, 3.5, 0);
+    const poleMat = new MeshStandardMaterial({ color: 0x5e5b58, roughness: 0.95, metalness: 0.05 });
+    const headGeo = new BoxGeometry(0.28,0.22,0.28);
+    const headMat = new MeshStandardMaterial({ color: 0x222222, emissive: 0x99ccff, emissiveIntensity: 0.0, roughness:0.7, metalness:0.0 });
+    // positions along roads every ~300m
+    const positions = [];
+  for(let x=-480; x<=480; x+=240){ positions.push(new Vector3(x,0, 11.8)); positions.push(new Vector3(x,0, -11.8)); }
+  for(let z=-480; z<=480; z+=240){ positions.push(new Vector3(11.8,0, z)); positions.push(new Vector3(-11.8,0, z)); }
+    positions.forEach(p=>{
+      const m = new Mesh(poleGeo, poleMat);
+      m.position.set(p.x, 0.02, p.z);
+      m.rotation.y = (Math.random()*2-1)*0.2; m.rotation.z = (Math.random()*2-1)*0.05;
+      poleGroup.add(m);
+      const head = new Mesh(headGeo, headMat.clone());
+      head.position.set(p.x + (Math.random()*2-1)*0.15, 6.8 + (Math.random()*2-1)*0.1, p.z + (Math.random()*2-1)*0.15);
+      scene.add(head);
+      const arc = new PointLight(0xa9d6ff, 0.0, 16, 2.2); arc.position.copy(head.position); arc.castShadow = false; scene.add(arc);
+      const ctrl = { base: 1.4 + Math.random()*1.6, speed: 3.0 + Math.random()*3.0, jitter: Math.random()*Math.PI*2, offProb: 0.1 + Math.random()*0.08, nextSpark: 0 };
+      utilPoles.push({ mesh:m, head, light:arc, ctrl });
+    });
+  })();
+
+  // simple concrete barricades (instanced boxes) near the intersection corners
+  const barricadePositions = [];
+  function addBarricadeCluster(cx, cz, count=12, spread=6){
+    for(let i=0;i<count;i++){
+      const ox = (Math.random()*2-1)*spread;
+      const oz = (Math.random()*2-1)*spread;
+      barricadePositions.push(new Vector3(cx+ox, 0, cz+oz));
+    }
+  }
+  addBarricadeCluster(16, 16); addBarricadeCluster(-16, 16); addBarricadeCluster(16, -16); addBarricadeCluster(-16, -16);
+  const barGeo = new BoxGeometry(1.6,0.9,0.6);
+  const barMat = new MeshStandardMaterial({ color: 0x8b8f95, roughness: 0.95, metalness: 0.0 });
+  const barInst = new InstancedMesh(barGeo, barMat, barricadePositions.length);
+  const barDummy = new THREE.Object3D();
+  barricadePositions.forEach((p, i)=>{
+    barDummy.position.set(p.x, 0.45, p.z);
+    barDummy.rotation.y = (Math.random()*2-1)*0.7;
+    barDummy.rotation.z = (Math.random()*2-1)*0.12;
+    const s = 0.9 + Math.random()*0.2; barDummy.scale.set(s, s, s);
+    barDummy.updateMatrix(); barInst.setMatrixAt(i, barDummy.matrix);
+  });
+  barInst.castShadow = true; barInst.receiveShadow = true; scene.add(barInst);
+
+  // subtle dust particles (points)
+  const dustGeo = new BufferGeometry();
+  const dustCount = 800;
+  const posArr = new Float32Array(dustCount*3);
+  // ダスト粒子の広がり範囲（地形縮小に合わせて調整）
+  const baseXZ = 140, baseY = 0.6;
+  for(let i=0;i<dustCount;i++){
+    posArr[i*3+0] = (Math.random()*2-1)*baseXZ;
+    posArr[i*3+1] = baseY + Math.random()*2.5;
+    posArr[i*3+2] = (Math.random()*2-1)*baseXZ;
+  }
+  dustGeo.setAttribute('position', new THREE.Float32BufferAttribute(posArr, 3));
+  const dustMat = new PointsMaterial({ color: 0xb7bdc3, size: 0.18, sizeAttenuation: true, transparent: true, opacity: 0.25, depthWrite: false });
+  const dustPoints = new Points(dustGeo, dustMat); scene.add(dustPoints);
+
+  // --- enemies: shadow humanoids (黒い人型、いびつな歩行 + リム発光)
+  const enemyGroup = new Group(); scene.add(enemyGroup);
+  const enemies = [];
+  // 共有ジオメトリ/マテリアル（ピボットを肩・股関節に）
+  // リム発光: フレネル近似でシルエットに発光を乗せる
+  // ベースのリムマテリアル（クローンして個体差を付与）
+  const rimMat = new ShaderMaterial({
+    uniforms: {
+      time: { value: 0 },
+      baseColor: { value: new Color(0x000000) },
+      rimColor: { value: new Color(0x88aaff) },
+      rimStrength: { value: 2.0 },
+      rimPower: { value: 2.4 },
+      flickerAmp: { value: 0.25 },
+      flickerRate: { value: 1.7 },
+      // 有機的な“柔らかさ”追加用
+      organicAmp: { value: 0.0 },      // 頂点変位振幅（個体ごとに設定）
+      noiseScale: { value: 3.5 },      // 変位ノイズの周波数
+      pulseRate: { value: 0.0 },       // 脈動速度
+      seed: { value: 0.0 }             // 個体ごとのシード
+    },
+    vertexShader: `
+      uniform float time; 
+      uniform float organicAmp; 
+      uniform float noiseScale; 
+      uniform float seed; 
+      varying vec3 vWorldNormal; 
+      varying vec3 vWorldPos; 
+      // 簡易 3 軸サインノイズで柔らかな鼓動風の変位
+      void main(){
+        float n1 = sin(position.x*noiseScale + time*0.7 + seed);
+        float n2 = sin(position.y*noiseScale*1.3 + time*1.2 + seed*2.0);
+        float n3 = sin(position.z*noiseScale*0.9 + time*0.5 + seed*3.0);
+        float disp = organicAmp * (n1 + n2 + n3) / 3.0; // 法線方向へ平均変位
+        vec3 displaced = position + normalize(normal) * disp;
+        vec4 wp = modelMatrix * vec4(displaced,1.0);
+        vWorldPos = wp.xyz;
+        vWorldNormal = normalize(mat3(modelMatrix) * normal);
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }
+    `,
+    fragmentShader: `
+      uniform vec3 baseColor; 
+      uniform vec3 rimColor; 
+      uniform float rimStrength; 
+      uniform float rimPower; 
+      uniform float flickerAmp; 
+      uniform float flickerRate; 
+      uniform float time; 
+      uniform float pulseRate; 
+      uniform float seed; 
+      varying vec3 vWorldNormal; 
+      varying vec3 vWorldPos; 
+      void main(){
+        vec3 V = normalize(cameraPosition - vWorldPos);
+        float fres = pow(1.0 - max(dot(normalize(vWorldNormal), V), 0.0), rimPower);
+        float flicker = 1.0 + flickerAmp * (sin(time*flickerRate + vWorldPos.x*0.7 + vWorldPos.y*1.3)+sin(time*1.1 + vWorldPos.z*0.9))*0.5;
+        float pulse = 0.85 + 0.35 * sin(time*pulseRate + seed*6.123); // 個体別脈動
+        vec3 col = baseColor + rimColor * (fres * rimStrength * flicker * pulse);
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `,
+    transparent: false
+  });
+  function makeLimbCyl(h, rTop=0.17, rBot=0.19, seg=14){
+    // 円柱（テーパー）で四肢を作る。関節側が原点（上）になるよう下方向へオフセット
+    const g = new CylinderGeometry(rTop, rBot, h, seg);
+    g.translate(0, -h*0.5, 0);
+    return g;
+  }
+  function makeFootBox(len=0.26, h=0.07, w=0.10){
+    // 足: 足首（上背側）をピボットに、つま先が前へ出る形
+    const g = new BoxGeometry(w, h, len);
+    g.translate(0, -h*0.5, len*0.25);
+    return g;
+  }
+  function makePalmBox(w=0.12, h=0.04, d=0.14){
+    // 掌: 手首をピボット（上背側）に、指方向へ少し前出し
+    const g = new BoxGeometry(w, h, d);
+    g.translate(0, -h*0.5, d*0.25);
+    return g;
+  }
+  const GEO = {
+    // より痩せ型：幅・半径を全体的に細く、長さはやや延長
+    torso: new BoxGeometry(0.40, 1.06, 0.22), // 互換用（未使用）
+    upperTorso: new BoxGeometry(0.38, 0.56, 0.22), // 肋骨まわり
+    lowerTorso: new BoxGeometry(0.36, 0.48, 0.20), // 骨盤まわり
+    neck:       new CylinderGeometry(0.06, 0.07, 0.12, 12),
+    head:  new THREE.SphereGeometry(0.14, 20, 20),
+    upperArm: makeLimbCyl(0.48, 0.09, 0.11),
+    lowerArm: makeLimbCyl(0.44, 0.08, 0.10),
+    hand:     makePalmBox(0.12, 0.04, 0.14), // 掌ボックス
+    fingerProx: makeLimbCyl(0.11, 0.035, 0.045),
+    fingerMid:  makeLimbCyl(0.10, 0.03,  0.04),
+    fingerDist: makeLimbCyl(0.09,  0.028, 0.035),
+    upperLeg: makeLimbCyl(0.56, 0.12, 0.16),
+    lowerLeg: makeLimbCyl(0.50, 0.11, 0.15),
+    foot:     makeFootBox(0.28, 0.07, 0.10)
+  };
+  function cloneRimForEntity(){
+    const m = rimMat.clone();
+    // deep-clone uniforms so each entity can vary independently
+    m.uniforms = THREE.UniformsUtils.clone(rimMat.uniforms);
+    // slight per-instance defaults (disabled for humans by default)
+    m.uniforms.seed.value = Math.random()*10.0;
+    m.uniforms.pulseRate.value = 0.0;
+    m.uniforms.organicAmp.value = 0.0;
+    return m;
+  }
+  function buildShadowHumanoid(targetHeight){
+    const root = new Group();
+    // ノード構成（簡易ボーン風の階層）
+    const hips = new Group(); hips.position.set(0, 1.0, 0); root.add(hips);
+    // 骨盤（下胴）と胸郭（上胴）に分割し、肩は上胴の子に
+  const humanMat = cloneRimForEntity(); // 人型はデフォルト有機変形オフ
+  const lowerTorso = new Mesh(GEO.lowerTorso, humanMat); lowerTorso.position.set(0, 0.30, 0); hips.add(lowerTorso);
+    // 追加: 脊柱中間グループで滑らかなひねり表現
+    const spineMid = new Group(); spineMid.position.set(0, 0.60, 0); hips.add(spineMid);
+  const upperTorso = new Mesh(GEO.upperTorso, humanMat); upperTorso.position.set(0, 0.10, 0); spineMid.add(upperTorso);
+  const neck = new Mesh(GEO.neck, humanMat); neck.position.set(0, 0.98, 0); upperTorso.add(neck);
+  const head = new Mesh(GEO.head, humanMat); head.position.set(0, 0.14, 0); head.scale.set(0.9, 1.15, 0.9); neck.add(head);
+    // 腕チェーン（鎖骨→肩）
+    const clavicleL = new Group(); clavicleL.position.set(+0.22, 0.18, 0); upperTorso.add(clavicleL);
+    const shoulderL = new Group(); shoulderL.position.set(+0.04, -0.06, 0); clavicleL.add(shoulderL);
+  const upperArmL = new Mesh(GEO.upperArm, humanMat); upperArmL.position.set(0, 0, 0); shoulderL.add(upperArmL);
+    const elbowL = new Group(); elbowL.position.set(0, -0.42, 0); shoulderL.add(elbowL);
+  const lowerArmL = new Mesh(GEO.lowerArm, humanMat); lowerArmL.position.set(0, 0, 0); elbowL.add(lowerArmL);
+    const wristL = new Group(); wristL.position.set(0, -0.38, 0); elbowL.add(wristL);
+  const handL = new Mesh(GEO.hand, humanMat); handL.position.set(0, 0, 0.0); wristL.add(handL);
+    // 左手の指（親指+4本）
+    function buildHandFingers(parent, side){
+      const fingers = [];
+      const isLeft = side === 'L';
+      const sgn = isLeft ? 1 : -1; // 外側方向
+      // 親指は基部を内側・前方にずらし、外旋
+      const bases = [
+        {x: sgn*0.035, z:-0.02, splay: sgn*0.35, yaw: sgn*0.35}, // thumb
+        {x: sgn*0.025, z: 0.00, splay: sgn*0.10, yaw: 0.0},      // index
+        {x: sgn*0.000, z: 0.01, splay: 0.0,         yaw: 0.0},   // middle
+        {x: sgn*-0.020, z: 0.00, splay: -sgn*0.10,  yaw: 0.0},   // ring
+        {x: sgn*-0.035, z:-0.01, splay: -sgn*0.18,  yaw: 0.0},   // little
+      ];
+      for(let fi=0; fi<5; fi++){
+        const b = new Group(); b.position.set(bases[fi].x, -0.015, 0.06 + bases[fi].z); parent.add(b);
+        b.rotation.y = bases[fi].yaw;
+        const prox = new Mesh(GEO.fingerProx, rimMat); prox.position.set(0,0,0); b.add(prox);
+        const midG = new Group(); midG.position.set(0, -0.095, 0); b.add(midG);
+        const mid = new Mesh(GEO.fingerMid, rimMat); mid.position.set(0,0,0); midG.add(mid);
+        const tipG = new Group(); tipG.position.set(0, -0.085, 0); midG.add(tipG);
+        const tip = new Mesh(GEO.fingerDist, rimMat); tip.position.set(0,0,0); tipG.add(tip);
+        fingers.push({ base:b, prox, midG, mid, tipG, tip, splayBase: bases[fi].splay });
+      }
+      return fingers;
+    }
+    const fingersL = buildHandFingers(handL, 'L');
+
+    const clavicleR = new Group(); clavicleR.position.set(-0.22, 0.18, 0); upperTorso.add(clavicleR);
+    const shoulderR = new Group(); shoulderR.position.set(-0.04, -0.06, 0); clavicleR.add(shoulderR);
+  const upperArmR = new Mesh(GEO.upperArm, humanMat); upperArmR.position.set(0, 0, 0); shoulderR.add(upperArmR);
+    const elbowR = new Group(); elbowR.position.set(0, -0.42, 0); shoulderR.add(elbowR);
+  const lowerArmR = new Mesh(GEO.lowerArm, humanMat); lowerArmR.position.set(0, 0, 0); elbowR.add(lowerArmR);
+    const wristR = new Group(); wristR.position.set(0, -0.38, 0); elbowR.add(wristR);
+  const handR = new Mesh(GEO.hand, humanMat); handR.position.set(0, 0, 0.0); wristR.add(handR);
+    const fingersR = buildHandFingers(handR, 'R');
+
+    // 脚チェーン
+  const hipL = new Group(); hipL.position.set(+0.11, 0.0, 0); hips.add(hipL);
+  const upperLegL = new Mesh(GEO.upperLeg, humanMat); upperLegL.position.set(0, 0, 0); hipL.add(upperLegL);
+    const kneeL = new Group(); kneeL.position.set(0, -0.46, 0); hipL.add(kneeL);
+  const lowerLegL = new Mesh(GEO.lowerLeg, humanMat); lowerLegL.position.set(0, 0, 0); kneeL.add(lowerLegL);
+    const ankleL = new Group(); ankleL.position.set(0, -0.40, 0); kneeL.add(ankleL);
+  const footL = new Mesh(GEO.foot, humanMat); footL.position.set(0, 0, 0); ankleL.add(footL);
+
+  const hipR = new Group(); hipR.position.set(-0.11, 0.0, 0); hips.add(hipR);
+  const upperLegR = new Mesh(GEO.upperLeg, humanMat); upperLegR.position.set(0, 0, 0); hipR.add(upperLegR);
+    const kneeR = new Group(); kneeR.position.set(0, -0.46, 0); hipR.add(kneeR);
+  const lowerLegR = new Mesh(GEO.lowerLeg, humanMat); lowerLegR.position.set(0, 0, 0); kneeR.add(lowerLegR);
+    const ankleR = new Group(); ankleR.position.set(0, -0.40, 0); kneeR.add(ankleR);
+  const footR = new Mesh(GEO.foot, humanMat); footR.position.set(0, 0, 0); ankleR.add(footR);
+
+  // 身長スケール調整：ターゲット身長に正規化（デフォルト2.45m程度）
+  const tgt = (typeof targetHeight === 'number' && isFinite(targetHeight)) ? targetHeight : 2.45;
+  const approxTotal = 2.30; // 上下胴+首込みの目安高さ（スケール前）
+  const SCALE = tgt / approxTotal;
+  root.scale.setScalar(SCALE);
+  return {
+    kind: 'human',
+    root,
+    hips, spineMid, upperTorso, lowerTorso, neck, head,
+    clavicleL, shoulderL, elbowL, wristL, handL, fingersL,
+    clavicleR, shoulderR, elbowR, wristR, handR, fingersR,
+    hipL, upperLegL, kneeL, lowerLegL, ankleL, footL,
+    hipR, upperLegR, kneeR, lowerLegR, ankleR, footR
+  };
+  }
+  // 四足獣モデル
+  function buildShadowBeast(targetHeight){
+    const root = new Group();
+    const beastMat = cloneRimForEntity();
+    // 有機パラメータ: 個体差を付けて脈動と柔らかさ
+    beastMat.uniforms.organicAmp.value = 0.045 + Math.random()*0.035; // 0.045-0.08
+    beastMat.uniforms.pulseRate.value = 0.9 + Math.random()*0.6;      // 0.9-1.5 Hz 程度
+    // 形状定義（簡易）
+    const pelvisGeo = new BoxGeometry(0.60,0.30,0.70);
+    const abdomenGeo = new BoxGeometry(0.55,0.28,0.55);
+    const chestGeo = new BoxGeometry(0.70,0.34,0.60);
+    const neckGeo = new CylinderGeometry(0.11,0.13,0.30,12);
+    const headGeo = new BoxGeometry(0.34,0.26,0.40);
+    const jawGeo = new BoxGeometry(0.34,0.10,0.32);
+    const foreUpper = new CylinderGeometry(0.13,0.16,0.78,14); foreUpper.translate(0,-0.39,0);
+    const foreLower = new CylinderGeometry(0.11,0.14,0.72,14); foreLower.translate(0,-0.36,0);
+    const foreClaw = new BoxGeometry(0.36,0.16,0.42); foreClaw.translate(0,-0.08,0.05);
+    const thighGeo = new CylinderGeometry(0.18,0.22,0.70,14); thighGeo.translate(0,-0.35,0);
+    const shankGeo = new CylinderGeometry(0.14,0.18,0.64,14); shankGeo.translate(0,-0.32,0);
+    const hoofGeo = new BoxGeometry(0.30,0.14,0.42); hoofGeo.translate(0,-0.07,0.10);
+    // 脊柱
+    const spineRoot = new Group(); spineRoot.position.set(0, 0.95, 0); root.add(spineRoot);
+  const pelvis = new Mesh(pelvisGeo, beastMat); pelvis.position.set(0, 0.00, -0.30); spineRoot.add(pelvis);
+    const spineA = new Group(); spineA.position.set(0, 0.08, -0.10); spineRoot.add(spineA);
+  const abdomen = new Mesh(abdomenGeo, beastMat); abdomen.position.set(0, 0.02, 0.00); spineA.add(abdomen);
+    const spineB = new Group(); spineB.position.set(0, 0.10, 0.20); spineA.add(spineB);
+    const spineC = new Group(); spineC.position.set(0, 0.10, 0.40); spineB.add(spineC);
+    const spineD = new Group(); spineD.position.set(0, 0.10, 0.58); spineC.add(spineD);
+  const chest = new Mesh(chestGeo, beastMat); chest.position.set(0, 0.02, 0.15); spineD.add(chest);
+    // 首と頭
+  const neck = new Mesh(neckGeo, beastMat); neck.position.set(0, 0.14, 0.55); chest.add(neck);
+  const head = new Mesh(headGeo, beastMat); head.position.set(0, 0.10, 0.20); neck.add(head);
+    const jawPivot = new Group(); jawPivot.position.set(0, -0.06, 0.08); head.add(jawPivot);
+  const jaw = new Mesh(jawGeo, beastMat); jaw.position.set(0, 0, 0); jawPivot.add(jaw);
+    // 前肢
+    const scapulaL = new Group(); scapulaL.position.set(+0.34, 0.05, 0.35); chest.add(scapulaL);
+    const shoulderL = new Group(); shoulderL.position.set(0.02, -0.04, 0.02); scapulaL.add(shoulderL);
+  const foreUpL = new Mesh(foreUpper, beastMat); shoulderL.add(foreUpL);
+    const elbowL = new Group(); elbowL.position.set(0, -0.72, 0); shoulderL.add(elbowL);
+  const foreLoL = new Mesh(foreLower, beastMat); elbowL.add(foreLoL);
+    const wristL = new Group(); wristL.position.set(0, -0.70, 0); elbowL.add(wristL);
+  const clawL = new Mesh(foreClaw, beastMat); wristL.add(clawL);
+    const scapulaR = new Group(); scapulaR.position.set(-0.34, 0.05, 0.35); chest.add(scapulaR);
+    const shoulderR = new Group(); shoulderR.position.set(-0.02, -0.04, 0.02); scapulaR.add(shoulderR);
+  const foreUpR = new Mesh(foreUpper, beastMat); shoulderR.add(foreUpR);
+    const elbowR = new Group(); elbowR.position.set(0, -0.72, 0); shoulderR.add(elbowR);
+  const foreLoR = new Mesh(foreLower, beastMat); elbowR.add(foreLoR);
+    const wristR = new Group(); wristR.position.set(0, -0.70, 0); elbowR.add(wristR);
+  const clawR = new Mesh(foreClaw, beastMat); wristR.add(clawR);
+    // 後肢
+    const hipL = new Group(); hipL.position.set(+0.24, -0.02, -0.28); pelvis.add(hipL);
+  const thighL = new Mesh(thighGeo, beastMat); hipL.add(thighL);
+    const kneeL = new Group(); kneeL.position.set(0, -0.62, 0); hipL.add(kneeL);
+  const shankL = new Mesh(shankGeo, beastMat); kneeL.add(shankL);
+    const ankleL = new Group(); ankleL.position.set(0, -0.58, 0.02); kneeL.add(ankleL);
+  const hoofL = new Mesh(hoofGeo, beastMat); ankleL.add(hoofL);
+    const hipR = new Group(); hipR.position.set(-0.24, -0.02, -0.28); pelvis.add(hipR);
+  const thighR = new Mesh(thighGeo, beastMat); hipR.add(thighR);
+    const kneeR = new Group(); kneeR.position.set(0, -0.62, 0); hipR.add(kneeR);
+  const shankR = new Mesh(shankGeo, beastMat); kneeR.add(shankR);
+    const ankleR = new Group(); ankleR.position.set(0, -0.58, 0.02); kneeR.add(ankleR);
+  const hoofR = new Mesh(hoofGeo, beastMat); ankleR.add(hoofR);
+    // 身長スケール
+    const tgt = (typeof targetHeight === 'number' && isFinite(targetHeight)) ? targetHeight : 2.6;
+    const approxTotal = 2.3;
+    const SCALE = tgt / approxTotal; root.scale.setScalar(SCALE);
+    return {
+      kind: 'beast',
+      root,
+      spineRoot, spineA, spineB, spineC, spineD, chest, abdomen, neck, head, jaw: jawPivot,
+      scapulaL, shoulderL, elbowL, wristL, clawL,
+      scapulaR, shoulderR, elbowR, wristR, clawR,
+      hipL, thighL, kneeL, shankL, ankleL, hoofL,
+      hipR, thighR, kneeR, shankR, ankleR, hoofR,
+      pelvis,
+      torso: chest,
+      material: beastMat
+    };
+  }
+  function createShadowEnemy(x, z){
+  // 生成時は全て四足獣（必要なら値を下げて混在に戻せます）
+  const BEAST_RATIO = 1.0;
+    const HEIGHT_RANGE_MIN = 2.55; // 身長最小 (m)
+    const HEIGHT_RANGE_MAX = 2.90; // 身長最大 (m)
+    const targetH = HEIGHT_RANGE_MIN + Math.random()*(HEIGHT_RANGE_MAX-HEIGHT_RANGE_MIN);
+    const useBeast = Math.random() < BEAST_RATIO;
+    const parts = useBeast ? buildShadowBeast(targetH) : buildShadowHumanoid(targetH);
+    const g = parts.root; g.position.set(x, 0.02, z); enemyGroup.add(g);
+    // 簡易当たり判定半径（獣は大きめ）
+    const colR = parts.kind==='beast' ? (0.95 + Math.random()*0.15) : (0.55 + Math.random()*0.15);
+    return {
+      node: g,
+      parts,
+      t: Math.random()*1000,
+  speed: 0.65 + Math.random()*0.55, // やや遅いが身長でストライド長を錯覚（不気味さ）
+      dir: Math.random()*Math.PI*2,
+      walkPhase: Math.random()*Math.PI*2,
+  walkRate: parts.kind==='beast' ? (2.2 + Math.random()*1.2) : (3.0 + Math.random()*1.5), // 四足はやや低め周期
+  legAmp: parts.kind==='beast' ? (0.55 + Math.random()*0.25) : (0.75 + Math.random()*0.30), // 四足は控えめ
+  armAmp: parts.kind==='beast' ? (0.65 + Math.random()*0.30) : (0.9 + Math.random()*0.35),  // 前肢
+      headJit: Math.random()*Math.PI*2,
+      sway: Math.random()*Math.PI*2,
+      freeze: 0, // 瞬間停止（不気味さ）
+      lean: (Math.random()*2-1)*0.15, // 体幹の傾きベース
+  baseHipY: parts.hips ? parts.hips.position.y : 1.0,
+  baseSpineY: parts.spineRoot ? parts.spineRoot.position.y : 1.0,
+      height: targetH,
+      // くねくね用パラメータ（関節の不規則なうねり・伸縮・痙攣）
+  wobbleA: (parts.kind==='beast'? 0.9 : 1.2) + Math.random()*1.0,       // 胴体第一うねり周波数
+  wobbleB: (parts.kind==='beast'? 1.8 : 2.2) + Math.random()*1.6,       // 胴体第二うねり周波数
+  bendAmp: (parts.kind==='beast'? 0.35 : 0.25) + Math.random()*0.25,     // 胴の大きなうねり振幅（四足は増）
+  neckStretchAmp: (parts.kind==='beast'? 0.18 : 0.12) + Math.random()*0.12, // 首伸縮振幅（獣は強め）
+  shoulderRollAmp: (parts.kind==='beast'? 0.18 : 0.25) + Math.random()*0.15, // 鎖骨/肩ロール
+  // 前肢の側方スプレイ量（獣のみ使用）
+  foreSplayAmp: parts.kind==='beast' ? (0.15 + Math.random()*0.25) : 0.0,
+  // 初期肩甲骨の左右位置（外側スプレイの基準）
+  baseScapulaLX: (parts.scapulaL ? parts.scapulaL.position.x : 0),
+  baseScapulaRX: (parts.scapulaR ? parts.scapulaR.position.x : 0),
+      sideSlide: Math.random()<0.5,
+      kneeFlipT: 0, // 膝の過伸展フェーズ
+      stretchT: 0,  // 首/腕の伸縮フェーズ
+      spasmT: 0,    // 微痙攣フェーズ
+      snapCD: 1.5 + Math.random()*2.0, // 向きスナップのクールダウン
+      // マテリアル個体差（有機変形を部位に反映するため root の material を拾う）
+      mat: (parts.material||null),
+      colR
+    };
+  }
+  function spawnEnemies(n=6){
+    for(let i=0;i<n;i++){
+    const ang = Math.random()*Math.PI*2; const dist = 30 + Math.random()*60; // 縮小マップに合わせスポーン距離短縮
+      const ex = camera.position.x + Math.cos(ang)*dist;
+      const ez = camera.position.z + Math.sin(ang)*dist;
+      enemies.push(createShadowEnemy(ex, ez));
+    }
+  }
+  spawnEnemies(7);
+
+  // night sky: stars
+  (function addStars(){
+    const starN = 1200; const g = new BufferGeometry();
+    const arr = new Float32Array(starN*3);
+    for(let i=0;i<starN;i++){
+      const r = 1800 + Math.random()*1200;
+      const ang = Math.random()*Math.PI*2;
+      const h = 600 + Math.random()*800;
+      arr[i*3+0] = Math.cos(ang)*r;
+      arr[i*3+1] = h;
+      arr[i*3+2] = Math.sin(ang)*r;
+    }
+    g.setAttribute('position', new THREE.Float32BufferAttribute(arr,3));
+    const m = new PointsMaterial({ color:0xcfd8ff, size:0.9, sizeAttenuation:true, transparent:true, opacity:0.85, depthWrite:false });
+    const stars = new Points(g,m); scene.add(stars);
+  })();
+
+  // moon: billboarded plane with procedural texture
+  function makeMoonTexture(w=256,h=256){
+    const c=document.createElement('canvas'); c.width=w; c.height=h; const ctx=c.getContext('2d');
+    ctx.fillStyle='#000'; ctx.fillRect(0,0,w,h);
+    const cx=w/2, cy=h/2, r=Math.min(w,h)*0.46;
+    // base disk
+    ctx.fillStyle='#dfe8ff'; ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.fill();
+    // simple craters
+    for(let i=0;i<26;i++){
+      const a=Math.random()*Math.PI*2; const rr=r*(0.2+Math.random()*0.7); const d=0.08*r+Math.random()*0.16*r;
+      const x=cx+Math.cos(a)*rr; const y=cy+Math.sin(a)*rr;
+      const grd=ctx.createRadialGradient(x,y, d*0.2, x,y, d);
+      grd.addColorStop(0,'rgba(120,130,160,0.35)');
+      grd.addColorStop(1,'rgba(0,0,0,0)');
+      ctx.fillStyle=grd; ctx.beginPath(); ctx.arc(x,y,d,0,Math.PI*2); ctx.fill();
+    }
+    return new CanvasTexture(c);
+  }
+  const moonTex = makeMoonTexture();
+  const moonMat = new MeshBasicMaterial({ map: moonTex, transparent:true, depthWrite:false, side:DoubleSide, color:0xffffff });
+  const moonGeo = new PlaneGeometry(80,80);
+  const moon = new Mesh(moonGeo, moonMat);
+  moon.position.set(-600, 420, -800);
+  scene.add(moon);
+
+  // --- simple collision system with 10m chunking (XZ plane)
+  const playerRadius = 0.45; // approximate camera capsule radius on ground plane
+  const CHUNK_SIZE = 10; // 10 meters per chunk
+  const circleColliders = []; // flat list (debug/optional)
+  const segmentColliders = []; // flat list (debug/optional)
+  const circleChunks = new Map(); // key:"cx,cz" -> Array<{x,z,r}>
+  const segmentChunks = new Map(); // key:"cx,cz" -> Array<segment>
+  const _tmpV = new THREE.Vector3();
+  function toChunkCoord(v){ return Math.floor(v / CHUNK_SIZE); }
+  function chunkKey(cx, cz){ return cx+','+cz; }
+  function pushCircleToChunk(obj){
+    const cx = toChunkCoord(obj.x), cz = toChunkCoord(obj.z);
+    const key = chunkKey(cx, cz);
+    let arr = circleChunks.get(key); if(!arr){ arr = []; circleChunks.set(key, arr); }
+    arr.push(obj);
+  }
+  function pushSegmentToChunks(seg){
+    const minX = Math.min(seg.ax, seg.bx) - seg.r, maxX = Math.max(seg.ax, seg.bx) + seg.r;
+    const minZ = Math.min(seg.az, seg.bz) - seg.r, maxZ = Math.max(seg.az, seg.bz) + seg.r;
+    const cminX = toChunkCoord(minX), cmaxX = toChunkCoord(maxX);
+    const cminZ = toChunkCoord(minZ), cmaxZ = toChunkCoord(maxZ);
+    for(let cz=cminZ; cz<=cmaxZ; cz++){
+      for(let cx=cminX; cx<=cmaxX; cx++){
+        const key = chunkKey(cx, cz);
+        let arr = segmentChunks.get(key); if(!arr){ arr = []; segmentChunks.set(key, arr); }
+        arr.push(seg);
+      }
+    }
+  }
+  function addCollider(x, z, r){
+    const obj = { x, z, r };
+    circleColliders.push(obj);
+    pushCircleToChunk(obj);
+  }
+  function collectNearby(posX, posZ, extraRadius=3){
+  const cx = toChunkCoord(posX), cz = toChunkCoord(posZ);
+  // LOAD CHUNK RADIUS is fixed to 4 as requested (pre-collected here via chunk maps)
+  const range = 4; // fixed load radius
+    const circles = [];
+    const segments = [];
+    for(let dz=-range; dz<=range; dz++){
+      for(let dx=-range; dx<=range; dx++){
+        const key = chunkKey(cx+dx, cz+dz);
+        const ca = circleChunks.get(key); if(ca) circles.push(...ca);
+        const sa = segmentChunks.get(key); if(sa) segments.push(...sa);
+      }
+    }
+    return { circles, segments };
+  }
+  function rebuildColliders(){
+    circleColliders.length = 0; segmentColliders.length = 0;
+    circleChunks.clear(); segmentChunks.clear();
+    // street lamp poles (from instanced matrices if available)
+    if(typeof poleInst !== 'undefined' && poleInst && typeof poleInst.count === 'number'){
+      const m = new THREE.Matrix4(); const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
+      const n = poleInst.count;
+      for(let i=0;i<n;i++){
+        poleInst.getMatrixAt(i, m); m.decompose(pos, quat, scl);
+        addCollider(pos.x, pos.z, 0.45);
+      }
+    } else if(Array.isArray(lampPositions)){
+      // fallback
+      for(const p of lampPositions){ addCollider(p.x, p.z, 0.45); }
+    }
+    // utility poles (individual meshes in utilPoles)
+    if(Array.isArray(utilPoles)){
+      for(const up of utilPoles){ if(up && up.mesh && up.mesh.position){ addCollider(up.mesh.position.x, up.mesh.position.z, 0.5); } }
+    }
+    // barricades (from instanced matrices if available)
+    if(typeof barInst !== 'undefined' && barInst && typeof barInst.count === 'number'){
+      const m = new THREE.Matrix4(); const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
+      const n = barInst.count;
+      for(let i=0;i<n;i++){
+        barInst.getMatrixAt(i, m); m.decompose(pos, quat, scl);
+        // approximate as circle using half-width/depth
+        const r = 0.5 * Math.hypot(0.8*scl.x, 0.3*scl.z); // tuned
+        addCollider(pos.x, pos.z, Math.max(0.5, r));
+      }
+    } else if(Array.isArray(barricadePositions)){
+      for(const bp of barricadePositions){ addCollider(bp.x, bp.z, 0.9); }
+    }
+    // cars (rough sphere around car body)
+    if(carGroup && carGroup.children){
+      for(const c of carGroup.children){ addCollider(c.position.x, c.position.z, 2.0); }
+    }
+    // signs / billboards
+    if(signGroup && signGroup.children){
+      for(const s of signGroup.children){ addCollider(s.position.x, s.position.z, 2.2); }
+    }
+    // neon panels
+    if(Array.isArray(neonMeshes)){
+      for(const n of neonMeshes){ addCollider(n.position.x, n.position.z, 1.0); }
+    }
+    // guardrail posts (instanced)
+    if(typeof postInst !== 'undefined' && postInst && typeof postInst.count === 'number'){
+      const m = new THREE.Matrix4(); const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
+      const n = postInst.count;
+      for(let i=0;i<n;i++){
+        postInst.getMatrixAt(i, m); m.decompose(pos, quat, scl);
+        addCollider(pos.x, pos.z, 0.2);
+      }
+    }
+    // guardrail rails (as segment capsules)
+    if(typeof railInst !== 'undefined' && railInst && typeof railInst.count === 'number'){
+      const m = new THREE.Matrix4(); const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
+      const n = railInst.count; const localA = new THREE.Vector3(-1.5,0,0); const localB = new THREE.Vector3(1.5,0,0);
+      const ta = new THREE.Vector3(); const tb = new THREE.Vector3();
+      for(let i=0;i<n;i++){
+        railInst.getMatrixAt(i, m); m.decompose(pos, quat, scl);
+        ta.copy(localA).applyQuaternion(quat).add(pos);
+        tb.copy(localB).applyQuaternion(quat).add(pos);
+        const cx = (ta.x + tb.x) * 0.5; const cz = (ta.z + tb.z) * 0.5;
+        const hx = Math.abs(tb.x - ta.x) * 0.5; const hz = Math.abs(tb.z - ta.z) * 0.5;
+        const seg = { ax:ta.x, az:ta.z, bx:tb.x, bz:tb.z, cx, cz, hx, hz, r: 0.18 };
+        segmentColliders.push(seg);
+        pushSegmentToChunks(seg);
+      }
+    }
+    // traffic cones (use base instanced positions)
+    if(typeof coneBaseInst !== 'undefined' && coneBaseInst && typeof coneBaseInst.count === 'number'){
+      const m = new THREE.Matrix4(); const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
+      const n = coneBaseInst.count;
+      for(let i=0;i<n;i++){
+        coneBaseInst.getMatrixAt(i, m); m.decompose(pos, quat, scl);
+        addCollider(pos.x, pos.z, 0.35 * Math.max(scl.x, scl.z));
+      }
+    }
+    // composite city towers
+    if(Array.isArray(cityTowers)){
+      for(const t of cityTowers){ addCollider(t.x, t.z, Math.max(3.5, t.radius)); }
+    }
+    // far towers (instanced)
+    if(typeof towerInst !== 'undefined' && towerInst && typeof towerInst.count === 'number'){
+      const m = new THREE.Matrix4(); const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
+      const n = towerInst.count;
+      for(let i=0;i<n;i++){
+        towerInst.getMatrixAt(i, m); m.decompose(pos, quat, scl);
+        const r = 0.5 * Math.hypot(scl.x, scl.z);
+        addCollider(pos.x, pos.z, Math.max(2.0, r));
+      }
+    }
+  }
+  // scrap, small batteries, big batteries
+  spawnPickups(12, 8, 4);
+  rebuildColliders();
+  function resolveCollisionsXZ(pos, radius){
+    const { circles, segments } = collectNearby(pos.x, pos.z, 4);
+    // circle colliders
+    for(let i=0;i<circles.length;i++){
+      const c = circles[i];
+      const dx = pos.x - c.x; const dz = pos.z - c.z;
+      const rr = radius + c.r;
+      // quick AABB-like reject to reduce sqrt calls
+      const aabbR = rr + 0.2; if(Math.abs(dx) > aabbR || Math.abs(dz) > aabbR) continue;
+      const distSq = dx*dx + dz*dz;
+      if(distSq < rr*rr){
+        const dist = Math.sqrt(Math.max(1e-6, distSq));
+        // if exactly overlapping center, nudge in a stable arbitrary direction
+        const nx = dist > 1e-6 ? dx/dist : 1.0; const nz = dist > 1e-6 ? dz/dist : 0.0;
+        const penetration = rr - dist;
+        pos.x += nx * penetration; pos.z += nz * penetration;
+      }
+    }
+    // segment capsule colliders (guardrails)
+    for(let i=0;i<segments.length;i++){
+      const s = segments[i];
+      // coarse reject using segment AABB expanded by radius
+      const pad = radius + s.r + 0.2;
+      if(Math.abs(pos.x - s.cx) > s.hx + pad || Math.abs(pos.z - s.cz) > s.hz + pad) continue;
+      const vx = s.bx - s.ax; const vz = s.bz - s.az;
+      const len2 = vx*vx + vz*vz; if(len2 < 1e-6) continue;
+      const wx = pos.x - s.ax; const wz = pos.z - s.az;
+      let t = (wx*vx + wz*vz) / len2; if(t < 0) t = 0; else if(t > 1) t = 1;
+      const cx = s.ax + t*vx; const cz = s.az + t*vz;
+      let px = pos.x - cx; let pz = pos.z - cz;
+      const rr = radius + s.r;
+      const d2 = px*px + pz*pz;
+      if(d2 < rr*rr){
+        const d = Math.sqrt(Math.max(d2, 1e-8));
+        let nx, nz;
+        if(d > 1e-8){ nx = px/d; nz = pz/d; }
+        else { // exactly on center: use perpendicular to segment as fallback
+          const segLen = Math.sqrt(len2) || 1.0; nx = +vz/segLen; nz = -vx/segLen;
+        }
+        const penetration = rr - d;
+        pos.x += nx * penetration; pos.z += nz * penetration;
+      }
+    }
+    return pos;
+  }
+
+  // player movement (pointer lock FPS)
+  let pitch = 0, yaw = 0;
+  const velocity = new Vector3(0,0,0);
+  const move = { forward:false, back:false, left:false, right:false };
+  const speed = 8.0;
+  const hVel = new Vector3(0,0,0);
+  const accel = 40.0, deccel = 30.0;
+  let velocityY = 0; const gravity = -25.0; const jumpSpeed = 10.0; let grounded = false;
+  let dashTime = 0; const dashDuration = 0.18; let dashCooldown = 0; const dashCooldownDur = 0.8; const dashMultiplier = 1.0; // 新ダッシュ=旧歩行
+  let stamina = 100.0; const staminaMax = 100.0; const staminaUseRate = 6.0; const staminaRegenRate = 18.0; let health = 100.0; const healthMax=100.0; let dashHeld=false;
+  // スタミナ枯渇時の鈍足・ダッシュ不可状態
+  let exhausted = false; const slowMultiplier = 0.5;
+
+  function onMouseMove(e){
+    if(document.pointerLockElement !== document.body) return;
+    const movementX = e.movementX || 0; const movementY = e.movementY || 0;
+    yaw -= movementX * 0.002; pitch -= movementY * 0.002;
+    pitch = Math.max(-Math.PI/2+0.01, Math.min(Math.PI/2-0.01, pitch));
+    camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, 'YXZ'));
+  }
+  function onKey(e, down){
+    const k = e.key.toLowerCase();
+  if(k==='w') move.forward = down; if(k==='s') move.back = down; if(k==='a') move.left = down; if(k==='d') move.right = down;
+  if(k==='m' && down){ toggleMap(); if(mapVisible) drawMap(); }
+  if(k==='o' && down){ toggleSettings(); }
+  if(k==='i' && down){ toggleInventory(); }
+  if(k==='e' && down){ tryInteract(); }
+  if(k==='r' && down){ tryUseBattery(); }
+    // Shift の押下/解放を常に反映（keyupでも反映されるように）
+    if(e.code === 'ShiftLeft' || e.code === 'ShiftRight' || e.key === 'Shift'){
+      dashHeld = down;
+      // ダッシュの瞬間ブーストは keydown のみで発火（疲労状態は不可）
+      if(down && !exhausted && dashCooldown<=0 && dashTime<=0 && stamina>5){ dashTime=dashDuration; dashCooldown=dashCooldownDur; }
+    }
+    if(down){
+      if(e.code === 'Space' || k===' ' || k==='spacebar'){ if(grounded){ velocityY = jumpSpeed; grounded=false; } }
+    }
+  }
+  window.addEventListener('mousemove', onMouseMove);
+  window.addEventListener('keydown', (e)=>onKey(e,true));
+  window.addEventListener('keyup', (e)=>onKey(e,false));
+  window.addEventListener('resize', sizeMapCanvas);
+  // 安全策: フォーカス喪失や可視状態変化、PointerLock解除時にダッシュ状態を解除
+  window.addEventListener('blur', ()=>{ dashHeld = false; });
+  document.addEventListener('visibilitychange', ()=>{ if(document.hidden){ dashHeld = false; } });
+  document.addEventListener('pointerlockchange', ()=>{ if(document.pointerLockElement !== document.body){ dashHeld = false; } });
+  // Battery UI helpers
+  function updateBatteryUI(){
+    const cells = [document.getElementById('bat-cell-1'),document.getElementById('bat-cell-2'),document.getElementById('bat-cell-3')];
+    for(let i=0;i<cells.length;i++){
+      const filled = (i < batterySegments);
+      const el = cells[i]; if(!el) continue;
+      el.style.opacity = filled? '1' : '0.18';
+      el.style.background = filled? '#2ecc71' : '#666';
+    }
+  }
+
+  // ---------- Interactables & Inventory ----------
+  const interactRay = new THREE.Raycaster();
+  interactRay.far = 3.0; // interact distance ~3m
+  // uses global interactables defined earlier
+  let highlighted = null; let highlightedPrevMat = null; let highlightedScale = 1;
+  // UI: crosshair + prompt
+  const crosshair = document.createElement('div');
+  Object.assign(crosshair.style, { position:'fixed', left:'50%', top:'50%', width:'6px', height:'6px', transform:'translate(-50%,-50%)', borderRadius:'50%', background:'rgba(255,255,255,0.9)', boxShadow:'0 0 8px rgba(255,255,255,0.6)', zIndex:9998, pointerEvents:'none' });
+  document.body.appendChild(crosshair);
+  const prompt = document.createElement('div');
+  Object.assign(prompt.style, { position:'fixed', left:'50%', top:'calc(50% + 18px)', transform:'translateX(-50%)', color:'#fff', background:'rgba(0,0,0,0.55)', padding:'4px 8px', borderRadius:'6px', fontSize:'13px', zIndex:9998, pointerEvents:'none', display:'none' });
+  document.body.appendChild(prompt);
+  // Inventory overlay
+  let inventoryVisible = false; const inventory = [];
+  const invOverlay = document.createElement('div'); invOverlay.id = 'inventory-overlay';
+  Object.assign(invOverlay.style, { position:'fixed', inset:'0', display:'none', alignItems:'center', justifyContent:'center', background:'rgba(0,0,0,0.55)', zIndex:9999 });
+  const invPanel = document.createElement('div');
+  Object.assign(invPanel.style, { background:'rgba(20,22,26,0.95)', color:'#fff', padding:'12px 14px', borderRadius:'8px', minWidth:'300px', maxWidth:'80vw', maxHeight:'70vh', overflow:'auto', boxShadow:'0 8px 24px rgba(0,0,0,0.6)' });
+  invPanel.innerHTML = '<div style="font-weight:700;margin-bottom:8px">インベントリ (Iで閉じる)</div><div id="inv-list"></div>';
+  invOverlay.appendChild(invPanel); document.body.appendChild(invOverlay);
+  function toggleInventory(force){
+    if(typeof force==='boolean') inventoryVisible = force; else inventoryVisible = !inventoryVisible;
+    invOverlay.style.display = inventoryVisible ? 'flex' : 'none';
+    if(inventoryVisible) renderInventory();
+  }
+  function renderInventory(){
+    const list = invPanel.querySelector('#inv-list'); if(!list) return;
+    if(!inventory.length){ list.innerHTML = '<div style="opacity:0.8">空です</div>'; return; }
+  list.innerHTML = inventory.map((it)=>`<div style=\"display:flex;align-items:center;gap:8px;padding:6px 4px;border-bottom:1px solid rgba(255,255,255,0.08)\"><div style=\"width:18px;height:18px;background:${it.color};border-radius:3px\"></div><div style=\"flex:1\">${it.name}</div><div style=\"opacity:0.7;font-size:12px\">x${it.qty}</div></div>`).join('');
+  }
+  function addToInventory(item){
+    const found = inventory.find(i=>i.kind===item.kind && i.name===item.name);
+    if(found) found.qty += 1; else inventory.push({ ...item, qty:1 });
+    renderInventory();
+  }
+  // Simple pickup spawner
+  // uses global pickupGroup defined earlier
+  function makePickup(kind, name, color=0x66e0ff){
+    const geo = new BoxGeometry(0.22, 0.22, 0.22);
+    const mat = new MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.15, roughness: 0.7, metalness: 0.05 });
+    const m = new Mesh(geo, mat); m.castShadow = true; m.receiveShadow = true;
+    m.userData.interactable = 'pickup'; m.userData.kind = kind; m.userData.name = name; m.userData.color = '#'+new Color(color).getHexString();
+    return m;
+  }
+  function spawnPickups(nScrap=14, nSmall=8, nBig=4){
+    function place(m){
+      const onX = Math.random()<0.5;
+      if(onX){ m.position.set((Math.random()*2-1)*60, 0.12, (Math.random()<0.5? 6.5 : -6.5) + (Math.random()*2-1)*4); }
+      else { m.position.set((Math.random()<0.5? 6.5 : -6.5) + (Math.random()*2-1)*4, 0.12, (Math.random()*2-1)*60); }
+      pickupGroup.add(m); interactables.push(m);
+      addCollider(m.position.x, m.position.z, 0.30);
+    }
+    for(let i=0;i<nScrap;i++) place(makePickup('scrap','スクラップ',[0x66e0ff,0xff71c5,0x3dff7a,0xffef55][(Math.random()*4)|0]));
+    for(let i=0;i<nSmall;i++) place(makePickup('battery_small','小バッテリー',0xaad16a));
+    for(let i=0;i<nBig;i++) place(makePickup('battery_big','大バッテリー',0xffc84d));
+  }
+
+  // full map overlay (toggle with 'm')
+  let mapVisible = false;
+  const mapOverlay = document.createElement('div');
+  mapOverlay.id = 'map-overlay';
+  Object.assign(mapOverlay.style, { position:'fixed', left:'0', top:'0', width:'100%', height:'100%', display:'none', background:'rgba(0,0,0,0.65)', zIndex:'9999', alignItems:'center', justifyContent:'center' });
+  mapOverlay.style.display = 'none';
+  mapOverlay.style.pointerEvents = 'none';
+  const mapCanvas = document.createElement('canvas');
+  const mapCtx = mapCanvas.getContext('2d');
+  mapOverlay.appendChild(mapCanvas);
+  document.body.appendChild(mapOverlay);
+  function sizeMapCanvas(){
+    const s = Math.min(window.innerWidth, window.innerHeight) * 0.9;
+    mapCanvas.width = Math.max(400, Math.floor(s));
+    mapCanvas.height = mapCanvas.width; // square
+    mapCanvas.style.boxShadow = '0 0 24px rgba(0,0,0,0.6)';
+    mapCanvas.style.border = '2px solid rgba(255,255,255,0.2)';
+  }
+  sizeMapCanvas();
+  // settings overlay (toggle with 'o')
+  let settingsVisible = false;
+  const settingsOverlay = document.createElement('div');
+  settingsOverlay.id = 'settings-overlay';
+  Object.assign(settingsOverlay.style, { position:'fixed', left:'0', top:'0', width:'100%', height:'100%', display:'none', background:'rgba(0,0,0,0.6)', zIndex:'9999', alignItems:'center', justifyContent:'center' });
+  const settingsPanel = document.createElement('div');
+  Object.assign(settingsPanel.style, { background:'rgba(20,22,26,0.95)', color:'#fff', padding:'16px 18px', borderRadius:'8px', minWidth:'320px', boxShadow:'0 8px 24px rgba(0,0,0,0.5)' });
+  settingsPanel.innerHTML = `
+    <div style="font-size:18px;font-weight:700;margin-bottom:12px">設定</div>
+    <div style="margin:10px 0">
+      <label for="draw-range">描画範囲（チャンク半径）: <span id="draw-value"></span></label>
+      <input id="draw-range" type="range" min="4" max="12" step="1" value="8" style="width:100%" />
+    </div>
+    <div style="margin:10px 0;color:#cfd8ff">読み込み範囲は 4 チャンクで固定</div>
+    <div style="margin-top:12px;text-align:right"><button id="close-settings" style="padding:6px 10px;border-radius:6px;border:0;background:#445; color:#fff">閉じる (O)</button></div>
+  `;
+  settingsOverlay.appendChild(settingsPanel);
+  document.body.appendChild(settingsOverlay);
+  function toggleSettings(force){
+    if(typeof force==='boolean') settingsVisible = force; else settingsVisible = !settingsVisible;
+    settingsOverlay.style.display = settingsVisible ? 'flex' : 'none';
+  }
+  function toggleMap(force){
+    if(typeof force==='boolean') mapVisible = force; else mapVisible = !mapVisible;
+    mapOverlay.style.display = mapVisible ? 'flex' : 'none';
+  }
+  // draw distance (chunks)
+  let drawChunkRadius = parseInt(localStorage.getItem('drawChunks')||'8',10);
+  drawChunkRadius = Math.max(4, Math.min(12, isNaN(drawChunkRadius)?8:drawChunkRadius));
+  const drawInput = settingsPanel.querySelector('#draw-range');
+  const drawValue = settingsPanel.querySelector('#draw-value');
+  const closeBtn = settingsPanel.querySelector('#close-settings');
+  if(drawInput && drawValue){
+    drawInput.value = String(drawChunkRadius);
+    drawValue.textContent = `${drawChunkRadius} チャンク`;
+    drawInput.addEventListener('input', ()=>{
+      drawChunkRadius = Math.max(4, Math.min(12, parseInt(drawInput.value,10)||8));
+      drawValue.textContent = `${drawChunkRadius} チャンク`;
+      localStorage.setItem('drawChunks', String(drawChunkRadius));
+    });
+  }
+  if(closeBtn){ closeBtn.addEventListener('click', ()=> toggleSettings(false)); }
+  // helper: world->map
+  const halfSize = terrainSize/2;
+  function w2mX(x, size){ return (x + halfSize) / terrainSize * size; }
+  function w2mZ(z, size){ return (z + halfSize) / terrainSize * size; }
+  function drawMap(){
+    const W = mapCanvas.width, H = mapCanvas.height; const size = W;
+    // background grid
+    mapCtx.clearRect(0,0,W,H);
+    mapCtx.fillStyle = '#131518'; mapCtx.fillRect(0,0,W,H);
+    // grid lines
+    mapCtx.strokeStyle = 'rgba(255,255,255,0.06)'; mapCtx.lineWidth = 1;
+    const grid = 10; // 10 cells each side
+    for(let i=1;i<grid;i++){
+      const t = i/grid; const p = Math.floor(t*W)+0.5; mapCtx.beginPath(); mapCtx.moveTo(p,0); mapCtx.lineTo(p,H); mapCtx.stroke(); mapCtx.beginPath(); mapCtx.moveTo(0,p); mapCtx.lineTo(W,p); mapCtx.stroke();
+    }
+    // roads
+    const roadW = 14; // width in meters
+    mapCtx.fillStyle = '#3f4449';
+    // x-road
+    const yRoad = Math.floor(w2mZ(0, size)); const hpx = Math.max(2, Math.floor((roadW/terrainSize)*size));
+    mapCtx.fillRect(0, yRoad - hpx/2, size, hpx);
+    // z-road
+    const xRoad = Math.floor(w2mX(0, size)); const wpx = Math.max(2, Math.floor((roadW/terrainSize)*size));
+    mapCtx.fillRect(xRoad - wpx/2, 0, wpx, size);
+    // city towers
+    if(Array.isArray(cityTowers) && cityTowers.length){
+      for(const t of cityTowers){
+        const cx = w2mX(t.x, size); const cz = w2mZ(t.z, size);
+        const rad = Math.max(3, (t.radius / terrainSize) * size * 2.1);
+        mapCtx.fillStyle = 'rgba(90, 206, 255, 0.25)';
+        mapCtx.strokeStyle = 'rgba(90, 206, 255, 0.6)'; mapCtx.lineWidth = 1.4;
+        mapCtx.beginPath(); mapCtx.arc(cx, cz, rad, 0, Math.PI*2); mapCtx.fill(); mapCtx.stroke();
+      }
+    }
+    if(Array.isArray(skybridges) && skybridges.length){
+      mapCtx.strokeStyle = 'rgba(255, 78, 163, 0.45)'; mapCtx.lineWidth = 1.8;
+      for(const br of skybridges){
+        mapCtx.beginPath();
+        mapCtx.moveTo(w2mX(br.ax, size), w2mZ(br.az, size));
+        mapCtx.lineTo(w2mX(br.bx, size), w2mZ(br.bz, size));
+        mapCtx.stroke();
+      }
+    }
+    // lamps
+    if(Array.isArray(lampPositions)){
+      mapCtx.fillStyle = '#ffdca8';
+      for(const lp of lampPositions){ const px = w2mX(lp.x, size), pz = w2mZ(lp.z, size); mapCtx.fillRect(px-1, pz-1, 2, 2); }
+    }
+    // utility poles
+    if(Array.isArray(utilPoles)){
+      mapCtx.fillStyle = '#a8cfff';
+      for(const up of utilPoles){ const px = w2mX(up.head.position.x, size), pz = w2mZ(up.head.position.z, size); mapCtx.fillRect(px-1, pz-1, 2, 2); }
+    }
+    // barricades
+    if(Array.isArray(barricadePositions)){
+      mapCtx.fillStyle = '#c0c5cc';
+      for(const bp of barricadePositions){ const px = w2mX(bp.x, size), pz = w2mZ(bp.z, size); mapCtx.fillRect(px-1, pz-1, 2, 2); }
+    }
+    // signs
+    if(signGroup && signGroup.children){ mapCtx.fillStyle = '#e6f2ff'; signGroup.children.forEach(s=>{ const px=w2mX(s.position.x,size), pz=w2mZ(s.position.z,size); mapCtx.fillRect(px-1,pz-1,2,2); }); }
+    // cars
+    if(carGroup && carGroup.children){ mapCtx.fillStyle = '#ff6b6b'; carGroup.children.forEach(c=>{ const px=w2mX(c.position.x,size), pz=w2mZ(c.position.z,size); mapCtx.fillRect(px-2,pz-2,4,4); }); }
+    // player arrow
+    const px = w2mX(camera.position.x, size), pz = w2mZ(camera.position.z, size);
+    const ang = yaw; // Y-axis yaw
+    const len = 10;
+    const ax = Math.cos(ang), az = Math.sin(ang);
+    mapCtx.fillStyle = '#ffffff'; mapCtx.strokeStyle = '#ffffff';
+    mapCtx.beginPath();
+    mapCtx.moveTo(px + ax*len, pz + az*len);
+    mapCtx.lineTo(px - az*6, pz + ax*6);
+    mapCtx.lineTo(px + az*6, pz - ax*6);
+    mapCtx.closePath(); mapCtx.fill();
+    // border
+    mapCtx.strokeStyle = 'rgba(255,255,255,0.25)'; mapCtx.lineWidth = 2; mapCtx.strokeRect(1,1,size-2,size-2);
+  }
+
+  // minimap (always-on, bottom-right)
+  const miniWrap = document.createElement('div');
+  miniWrap.id = 'minimap';
+  Object.assign(miniWrap.style, { position:'fixed', right:'12px', bottom:'12px', zIndex:'9998', pointerEvents:'none' });
+  const miniCanvas = document.createElement('canvas'); const miniCtx = miniCanvas.getContext('2d'); miniWrap.appendChild(miniCanvas); document.body.appendChild(miniWrap);
+  function sizeMiniMapCanvas(){
+    const s = Math.max(140, Math.min(260, Math.floor(Math.min(window.innerWidth, window.innerHeight)*0.22)));
+    miniCanvas.width = s; miniCanvas.height = s;
+    miniCanvas.style.border = '1px solid rgba(255,255,255,0.25)'; miniCanvas.style.boxShadow = '0 0 12px rgba(0,0,0,0.5)';
+  }
+  sizeMiniMapCanvas();
+  function drawMiniMap(){
+    const W = miniCanvas.width, H = miniCanvas.height; const size = W;
+    miniCtx.clearRect(0,0,W,H);
+    // background
+    miniCtx.fillStyle = 'rgba(10,12,14,0.9)'; miniCtx.fillRect(0,0,W,H);
+    // roads
+    const roadW = 14; miniCtx.fillStyle = '#3f4449';
+    const yRoad = Math.floor(w2mZ(0, size)); const hpx = Math.max(2, Math.floor((roadW/terrainSize)*size)); miniCtx.fillRect(0, yRoad - hpx/2, size, hpx);
+    const xRoad = Math.floor(w2mX(0, size)); const wpx = Math.max(2, Math.floor((roadW/terrainSize)*size)); miniCtx.fillRect(xRoad - wpx/2, 0, wpx, size);
+    if(Array.isArray(cityTowers) && cityTowers.length){
+      for(const t of cityTowers){
+        const cx = w2mX(t.x, size); const cz = w2mZ(t.z, size);
+        const rad = Math.max(2, (t.radius / terrainSize) * size * 2.0);
+        miniCtx.fillStyle = 'rgba(90, 206, 255, 0.25)'; miniCtx.strokeStyle = 'rgba(90, 206, 255, 0.55)'; miniCtx.lineWidth = 1.0;
+        miniCtx.beginPath(); miniCtx.arc(cx, cz, rad, 0, Math.PI*2); miniCtx.fill(); miniCtx.stroke();
+      }
+    }
+    if(Array.isArray(skybridges) && skybridges.length){
+      miniCtx.strokeStyle = 'rgba(255, 78, 163, 0.4)'; miniCtx.lineWidth = 1.2;
+      for(const br of skybridges){
+        miniCtx.beginPath();
+        miniCtx.moveTo(w2mX(br.ax, size), w2mZ(br.az, size));
+        miniCtx.lineTo(w2mX(br.bx, size), w2mZ(br.bz, size));
+        miniCtx.stroke();
+      }
+    }
+    // player arrow
+    const px = w2mX(camera.position.x, size), pz = w2mZ(camera.position.z, size);
+    const ang = yaw; const len = 8; const ax = Math.cos(ang), az = Math.sin(ang);
+    miniCtx.fillStyle = '#ffffff'; miniCtx.beginPath();
+    miniCtx.moveTo(px + ax*len, pz + az*len);
+    miniCtx.lineTo(px - az*5, pz + ax*5);
+    miniCtx.lineTo(px + az*5, pz - ax*5);
+    miniCtx.closePath(); miniCtx.fill();
+    // border
+    miniCtx.strokeStyle = 'rgba(255,255,255,0.2)'; miniCtx.lineWidth = 1; miniCtx.strokeRect(0.5,0.5,size-1,size-1);
+  }
+
+  // pointer lock button
+  const startBtn = document.getElementById('startBtn');
+  startBtn.addEventListener('click', ()=>{
+    document.body.requestPointerLock();
+    startAudio();
+    document.getElementById('overlay').style.display = 'none';
+  });
+
+  // audio: wind only (no birds) for post-apocalypse
+  let audioStarted = false;
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  function createNoiseBuffer(duration){
+    const rate = audioCtx.sampleRate; const buf = audioCtx.createBuffer(1, rate*duration, rate);
+    const data = buf.getChannelData(0); for(let i=0;i<data.length;i++) data[i] = (Math.random()*2-1)*0.4; return buf;
+  }
+  function startAudio(){
+    if(audioStarted) return; audioStarted = true;
+    // 一部ブラウザでの自動停止対策
+    if(audioCtx.state === 'suspended'){
+      try{ audioCtx.resume(); }catch(e){}
+    }
+    const noise = audioCtx.createBufferSource(); noise.buffer = createNoiseBuffer(2.0); noise.loop = true;
+    const lp = audioCtx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=500;
+    const hp = audioCtx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=80;
+    const gain = audioCtx.createGain(); gain.gain.value = 0.12;
+    noise.connect(lp); lp.connect(hp); hp.connect(gain); gain.connect(audioCtx.destination); noise.start();
+  }
+
+  // spark sound (short, noisy, bright)
+  function playSparkAt(pos){
+    // simple one-shot using white noise shaped with bandpass and exponential decay
+    const src = audioCtx.createBufferSource(); src.buffer = createNoiseBuffer(0.2); src.loop = false;
+    const bp = audioCtx.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value = 3500; bp.Q.value = 3.5;
+    const g = audioCtx.createGain(); g.gain.value = 0.18;
+    const t = audioCtx.currentTime;
+    g.gain.setValueAtTime(0.18, t); g.gain.exponentialRampToValueAtTime(0.001, t+0.15);
+    src.connect(bp); bp.connect(g); g.connect(audioCtx.destination); src.start();
+  }
+
+  // footstep (short thump + noise), non-spatial for simplicity
+  function playFootstep(strength=1.0){
+    const t = audioCtx.currentTime;
+    // thump: sine burst
+    const osc = audioCtx.createOscillator();
+    const og = audioCtx.createGain();
+    osc.type = 'sine'; osc.frequency.value = 95 + Math.random()*55; // 95-150 Hz
+    og.gain.setValueAtTime(0.0, t);
+    og.gain.linearRampToValueAtTime(0.16 * strength, t + 0.008);
+    og.gain.exponentialRampToValueAtTime(0.001, t + 0.14);
+    osc.connect(og);
+    // grit: short noise through bandpass
+    const ns = audioCtx.createBufferSource(); ns.buffer = createNoiseBuffer(0.12);
+    const bp = audioCtx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 900 + Math.random()*800; bp.Q.value = 0.7 + Math.random()*0.8;
+    const ng = audioCtx.createGain(); ng.gain.setValueAtTime(0.07 * strength, t); ng.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+    ns.connect(bp); bp.connect(ng);
+    // master for the step
+    const g = audioCtx.createGain(); g.gain.value = 0.16 * Math.min(1.4, Math.max(0.5, strength)); // overall step volume
+    og.connect(g); ng.connect(g); g.connect(audioCtx.destination);
+    osc.start(t); osc.stop(t + 0.16);
+    ns.start(t); ns.stop(t + 0.14);
+  }
+
+  // loop
+  const clock = new THREE.Clock();
+  let timeElapsed = 0;
+  // 足音: 距離ベースの歩幅でトリガー
+  let stepAcc = 0; // 累積移動距離（m）
+  function animate(){
+    requestAnimationFrame(animate);
+    const dt = Math.min(0.05, clock.getDelta());
+    timeElapsed += dt;
+    const forward = new Vector3(); camera.getWorldDirection(forward); forward.y=0; forward.normalize();
+    const right = new Vector3().crossVectors(forward, new Vector3(0,1,0)).normalize();
+
+  // スタミナと速度倍率（ダッシュ／疲労）
+  let speedMul = slowMultiplier; // 新デフォルト歩行=旧鈍足
+  if(exhausted){
+    // 疲労中は鈍足、ダッシュ不可。スタミナ満タンで解除
+    dashTime = 0; // 残りダッシュを即座に無効化
+    speedMul = slowMultiplier;
+    stamina = Math.min(staminaMax, stamina + staminaRegenRate*dt);
+    if(stamina >= staminaMax){ exhausted = false; }
+  } else {
+    // 通常時: ダッシュ残時間／クールダウン
+    if(dashTime>0){ speedMul = dashMultiplier; dashTime -= dt; }
+    if(dashCooldown>0) dashCooldown -= dt;
+    // 押下ダッシュ中はスタミナを継続消費。0 到達で疲労突入
+    if(dashHeld){
+      const use = staminaUseRate * dt;
+      stamina = Math.max(0, stamina - use);
+      if(stamina > 0){
+        speedMul = Math.max(speedMul, dashMultiplier); // 1.0 まで上げる=旧歩行
+      } else {
+        exhausted = true; dashTime = 0; // 枯渇で即疲労化
+      }
+    } else {
+      stamina = Math.min(staminaMax, stamina + staminaRegenRate*dt);
+    }
+  }
+
+    const targetDir = new Vector3(); if(move.forward) targetDir.add(forward); if(move.back) targetDir.sub(forward); if(move.left) targetDir.sub(right); if(move.right) targetDir.add(right); if(targetDir.length()>0) targetDir.normalize();
+  const targetVel = targetDir.multiplyScalar(speed*speedMul);
+    const dv = new Vector3().subVectors(targetVel, hVel); const dvLen = dv.length(); if(dvLen>0){ const maxA = (targetDir.length()>0?accel:deccel)*dt; const change = Math.min(maxA, dvLen); hVel.add(dv.normalize().multiplyScalar(change)); }
+  const moveStep = hVel.clone().multiplyScalar(dt);
+  // tentative horizontal move with collision resolution against static colliders
+  if(moveStep.x !== 0 || moveStep.z !== 0){
+    const tentative = camera.position.clone();
+    tentative.x += moveStep.x; tentative.z += moveStep.z;
+    resolveCollisionsXZ(tentative, playerRadius);
+    camera.position.x = tentative.x; camera.position.z = tentative.z;
+  }
+  const horizSpeed = hVel.length();
+
+    velocityY += gravity*dt; camera.position.y += velocityY*dt;
+    const groundY = 0; const eyeHeight = 1.6; const targetY = groundY + eyeHeight;
+  if(camera.position.y <= targetY){ camera.position.y = targetY; velocityY = 0; grounded = true; }
+    else { grounded = false; const damping = 6.0; camera.position.y += (targetY - camera.position.y) * Math.min(1, damping*dt); }
+
+    // streetlight flicker update
+    const camPos = camera.position;
+    // chunk-based visibility helper
+    const camCX = Math.floor(camPos.x / CHUNK_SIZE), camCZ = Math.floor(camPos.z / CHUNK_SIZE);
+    function inDrawChunks(x, z){
+      const cx = Math.floor(x / CHUNK_SIZE), cz = Math.floor(z / CHUNK_SIZE);
+      return Math.abs(cx - camCX) <= drawChunkRadius && Math.abs(cz - camCZ) <= drawChunkRadius;
+    }
+
+    // --- animate fog sheets (slow drift + keep near camera)
+    if(Array.isArray(fogSheets)){
+      for(const f of fogSheets){
+        const m = f.m; const a = timeElapsed*0.05 + f.dir;
+        m.position.x += Math.sin(a)*0.05; m.position.z += Math.cos(a)*0.06;
+        // softly tether to camera within a radius so they surround the player
+        const dx = m.position.x - camera.position.x; const dz = m.position.z - camera.position.z; const r2 = dx*dx + dz*dz; const maxR = 260;
+        if(r2 > maxR*maxR){
+          const ang = Math.random()*Math.PI*2; const r = 120 + Math.random()*120;
+          m.position.set(camera.position.x + Math.cos(ang)*r, m.position.y, camera.position.z + Math.sin(ang)*r);
+        }
+      }
+    }
+
+    // (rain update removed)
+
+    // Flashlight battery drain and intensity
+    if(batterySegments>0){
+      // convert rate (segments per minute) to per second drain
+      const perSec = batteryDrainRate/60;
+      batteryAccum += perSec * dt;
+      if(batteryAccum >= 1){ batteryAccum -= 1; batterySegments = Math.max(0, batterySegments-1); updateBatteryUI(); }
+    }
+  const segRatio = batterySegments / batteryMaxSegments;
+  flashlightSpot.intensity = 3.0 * segRatio;
+  flashlightSpot.distance = 16 + 8 * segRatio;
+  flashlightPoint.intensity = 0.4 * segRatio;
+  // update spotlight target to camera forward point
+  const forwardDir = new Vector3(); camera.getWorldDirection(forwardDir);
+  forwardDir.normalize();
+  flashlightTarget.position.copy(camera.position).addScaledVector(forwardDir, 10);
+
+    // Interact raycast & highlight
+    interactRay.setFromCamera(new Vector3(0,0), camera);
+    const hits = interactRay.intersectObjects(interactables, false);
+    let target = null;
+    for(let i=0;i<hits.length;i++){ if(hits[i].distance <= interactRay.far){ target = hits[i].object; break; } }
+    if(highlighted && highlighted !== target){
+      highlighted.scale.setScalar(highlightedScale);
+      if(highlightedPrevMat){ highlighted.material.emissiveIntensity = highlightedPrevMat.emissiveIntensity; }
+      highlighted = null; highlightedPrevMat = null; prompt.style.display = 'none';
+    }
+    if(target && target.userData && target.userData.interactable){
+      if(!highlighted){ highlighted = target; highlightedScale = highlighted.scale.x; highlightedPrevMat = { emissiveIntensity: (target.material && target.material.emissiveIntensity)||0 };
+      }
+      highlighted.scale.setScalar(highlightedScale*1.15);
+      if(highlighted.material) highlighted.material.emissiveIntensity = 0.6;
+      let label;
+      if(target.userData.interactable==='pickup'){
+        label = `【E】拾う: ${target.userData.name}`;
+        if(target.userData.kind==='battery_small') label += '（+1）';
+        if(target.userData.kind==='battery_big') label += '（+3）';
+      } else {
+        label = '【E】アクション';
+      }
+      prompt.textContent = label; prompt.style.display = 'block';
+    }
+    // Arms bobbing and reach animation
+    const moveAmount = hVel.length();
+    armBob += dt * (grounded ? (4.0 + 2.0*Math.min(1, moveAmount)) : 0);
+  const bob = grounded ? Math.sin(armBob) * 0.05 * Math.min(1, moveAmount*0.4) : 0;
+    rightShoulder.rotation.z = 0.15 + bob*0.6;
+  rightShoulder.rotation.x = -0.2 + Math.cos(armBob*0.5)*0.05;
+  rightElbow.rotation.x = -0.6 + Math.sin(armBob+Math.PI*0.2)*0.15;
+    if(armReachT > 0){ armReachT = Math.max(0, armReachT - dt*3.5); }
+    const reachK = armReachT>0 ? (1 - Math.pow(1-armReachT, 2)) : 0;
+    rightShoulder.rotation.x -= 0.8*reachK; rightElbow.rotation.x -= 0.6*reachK; rightWrist.rotation.x += 0.4*reachK; armsGroup.position.z = -0.36 - 0.22*reachK;
+    // Finger curl animation (grip when reaching or on movement emphasis)
+    const baseGrip = reachK; // 0..1 from interaction reach
+    const moveGrip = Math.min(1, moveAmount*0.15);
+    const grip = Math.min(1, baseGrip * 0.8 + moveGrip*0.4);
+  function applyFingerSet(fingers, g){
+      for(const f of fingers){
+        // thumb has more yaw-based opposition; use different curl speed
+        const thumbMul = f.isThumb ? 0.7 : 1.0;
+        const k = g * thumbMul;
+        // base (proximal) flex (negative x rotates downward since geometry points -Y downward)
+        f.base.rotation.x = -1.2 * k;
+        f.midG.rotation.x = -1.1 * k;
+        f.tipG.rotation.x = -1.0 * k;
+        if(f.isThumb){
+      f.base.rotation.y = (f.baseYaw||0) + 0.15 * k; // slight opposition adjustment
+        }
+      }
+    }
+    applyFingerSet(rightFingers, grip);
+    applyFingerSet(leftFingers, grip*0.6); // left hand stays more relaxed
+    const lightActiveRange = 180; // keep light update threshold as safety
+    for(let i=0;i<lampLights.length;i++){
+      const light = lampLights[i]; const head = lampMeshes[i]; const f = lampFlick[i];
+      const near = inDrawChunks(light.position.x, light.position.z);
+      if(!near){ light.visible = false; if(head) head.visible = false; continue; }
+      light.visible = true; if(head) head.visible = true;
+      const outage = (Math.random() < f.offProb*dt) ? 0.0 : 1.0;
+      const wave = 0.6 + 0.4*Math.abs(Math.sin(timeElapsed*f.speed + f.jitter));
+      light.intensity = f.base * wave * outage;
+      if (head && head.material) head.material.emissiveIntensity = 0.5 + 0.7*wave*outage;
+    }
+
+    // dust gentle drift
+    const pAttr = dustGeo.getAttribute('position');
+    for(let i=0;i<dustCount; i++){
+      const ix = i*3, iy = ix+1, iz = ix+2;
+      let x = pAttr.array[ix], y = pAttr.array[iy], z = pAttr.array[iz];
+      x += Math.sin((i*13.1 + timeElapsed*0.3))*0.02;
+      z += Math.cos((i*7.7 + timeElapsed*0.27))*0.02;
+      y += (Math.sin((i*5.3 + timeElapsed*0.8))*0.003);
+      // wrap to keep near origin
+      if(x>baseXZ) x=-baseXZ; if(x<-baseXZ) x=baseXZ; if(z>baseXZ) z=-baseXZ; if(z<-baseXZ) z=baseXZ;
+      pAttr.array[ix]=x; pAttr.array[iy]=y; pAttr.array[iz]=z;
+    }
+    pAttr.needsUpdate = true;
+
+  const coordsEl = document.getElementById('coords'); if(coordsEl){ coordsEl.textContent = `x:${camera.position.x.toFixed(2)} y:${camera.position.y.toFixed(2)} z:${camera.position.z.toFixed(2)}`; }
+    const stBar = document.getElementById('stamina-bar');
+    if(stBar){
+      const ratio = Math.max(0, Math.min(1, stamina / staminaMax));
+      stBar.style.width = `${ratio * 100}%`;
+      const dashActive = (!exhausted) && ((dashTime>0) || (dashHeld && stamina>0));
+      // 色分岐: 疲労中はグレー、ダッシュ中はシアン、低スタミナは警告色
+      if(exhausted){
+        stBar.style.background = 'linear-gradient(90deg,#bbb,#777)';
+      } else if(dashActive){
+        stBar.style.background = 'linear-gradient(90deg,#6ff,#0cf)';
+      } else if(ratio < 0.1){
+        stBar.style.background = 'linear-gradient(90deg,#f66,#d00)';
+      } else if(ratio < 0.3){
+        stBar.style.background = 'linear-gradient(90deg,#fc6,#f80)';
+      } else {
+        stBar.style.background = 'linear-gradient(90deg,#7cf,#06f)';
+      }
+    }
+    const hpBar = document.getElementById('health-bar');
+    if(hpBar){
+      const ratio = Math.max(0, Math.min(1, health / healthMax));
+      hpBar.style.width = `${ratio * 100}%`;
+      // color: green -> yellow -> red
+      const r = Math.floor(255 * (1 - ratio));
+      const g = Math.floor(200 * (0.4 + 0.6*ratio));
+      const color = `rgb(${r}, ${g}, 40)`;
+      hpBar.style.background = color;
+      const hpText = document.getElementById('health-text');
+      if(hpText) hpText.textContent = `${Math.round(health)} / ${Math.round(healthMax)}`;
+    }
+
+    // 足音: 地上かつ移動時、移動距離で歩幅を超えたら再生
+    if(audioStarted && grounded && horizSpeed > 0.2){
+      stepAcc += horizSpeed * dt; // m/frame
+      const dashActive = (!exhausted) && ((dashTime>0) || (dashHeld && stamina>0));
+      const stride = exhausted ? 1.9 : (dashActive ? 1.2 : 1.8);
+      const strength = exhausted ? 0.8 : (dashActive ? 1.2 : 1.0);
+      if(stepAcc >= stride){
+        playFootstep(strength);
+        stepAcc -= stride;
+      }
+    } else {
+      // 立ち止まり・空中ではリセット（次の一歩を安定化）
+      stepAcc = 0;
+    }
+
+  // update maps
+  if(mapVisible){ drawMap(); }
+  drawMiniMap();
+
+  // update enemies (shadow humanoids). Chunk-based visibility + いびつな歩行
+  // グローバルテンプレートは保持しつつ、個体マテリアル time を後段で更新
+    for(let i=0;i<enemies.length;i++){
+      const e = enemies[i]; const n = e.node; const p = e.parts;
+      if(!inDrawChunks(n.position.x, n.position.z)){ n.visible=false; continue; } else n.visible=true;
+      e.t += dt; e.sway += dt*1.0;
+  // フリーズ挙動
+      if(e.freeze <= 0 && Math.random()<0.003){ e.freeze = 0.25 + Math.random()*0.55; }
+      if(e.freeze>0) e.freeze -= dt;
+  // 個体マテリアルの時間更新（脈動・有機変形）
+  if(e.mat && e.mat.uniforms){ e.mat.uniforms.time.value = timeElapsed; }
+  // 進行方向ノイズ + 急旋回（不規則性をやや強く）
+  e.dir += (Math.sin(e.t*0.21 + i)*0.6 + Math.sin(e.t*0.44 + i*1.1)*0.35)*0.07*dt;
+  if(Math.random()<0.0016){ e.dir += (Math.random()*2-1)*Math.PI*0.85; }
+  const baseMul = 0.5 + 0.5*Math.abs(Math.sin(e.sway*0.78 + i));
+  const sp = e.speed * (e.freeze>0?0.03:baseMul);
+      const mx = Math.cos(e.dir)*sp*dt; const mz = Math.sin(e.dir)*sp*dt;
+      if(mx||mz){
+        const tentative=n.position.clone(); tentative.x+=mx; tentative.z+=mz;
+        resolveCollisionsXZ(tentative,0.4);
+        n.position.x=tentative.x; n.position.z=tentative.z;
+      }
+      // 向き補間
+  const targetYaw = Math.atan2(mz, mx);
+      if(isFinite(targetYaw)){ let ay=n.rotation.y; let dy=((targetYaw - ay + Math.PI)%(Math.PI*2))-Math.PI; n.rotation.y = ay + dy*Math.min(1,6*dt);}      
+  // 歩行位相 + くねくね位相
+  const gaitMul = e.freeze>0?0.05:(0.55+0.65*baseMul); 
+  e.walkPhase += dt*e.walkRate*gaitMul; 
+  const ph=e.walkPhase; const strideSin = Math.sin(ph);
+  const wob = Math.sin(e.t*e.wobbleA + i*0.7)*0.5 + Math.sin(e.t*e.wobbleB + i*1.3)*0.5;
+  // 四足ビースト用アニメ分岐
+  if(p.kind==='beast'){
+    // 対角のトロット: 前左と後右、前右と後左
+    const fL = Math.sin(ph);
+    const fR = Math.sin(ph + Math.PI);
+    const hL = Math.sin(ph + Math.PI);
+    const hR = Math.sin(ph);
+    // 背骨のうねり
+    if(p.spineRoot){ p.spineRoot.rotation.y = Math.sin(ph*0.35 + wob*0.3)*0.07; p.spineRoot.rotation.x = Math.sin(ph*0.22 + wob*0.2) * (0.05 + e.bendAmp*0.22); }
+    if(p.spineA){ p.spineA.rotation.x = (Math.sin(ph*0.45) + wob*0.55) * (0.05 + e.bendAmp*0.26); }
+    if(p.spineB){ p.spineB.rotation.x = (Math.sin(ph*0.50+0.4) + wob*0.55) * (0.055 + e.bendAmp*0.28); }
+    if(p.spineC){ p.spineC.rotation.x = (Math.sin(ph*0.55+0.8) + wob*0.55) * (0.06 + e.bendAmp*0.30); }
+    if(p.spineD){ p.spineD.rotation.x = (Math.sin(ph*0.60+1.2) + wob*0.55) * (0.065 + e.bendAmp*0.33); }
+    if(p.chest){
+      // 呼吸スケール: 胸郭と腹部をわずかに膨張/収縮
+      const breath = Math.sin(e.t*0.6 + i*0.3);
+      p.chest.rotation.z = Math.sin(e.t*1.9 + wob)*0.05;
+      p.chest.scale.y = 1.0 + 0.02*breath;
+      p.chest.scale.x = 1.0 + 0.01*breath;
+      if(p.abdomen){ p.abdomen.scale.y = 1.0 + 0.015*breath; }
+    }
+
+    // --- Player vs Enemy collision (円同士) ---
+    // カメラ位置を敵半径 + playerRadius で押し戻す
+    const px = camera.position.x; const pz = camera.position.z;
+    for(let i=0;i<enemies.length;i++){
+      const e = enemies[i]; const n = e.node;
+      if(!n.visible) continue; // 遠距離非表示時は省略
+      const dx = px - n.position.x; const dz = pz - n.position.z;
+      const dist2 = dx*dx + dz*dz;
+      const r = playerRadius + (e.colR||0.8);
+      if(dist2 > 0 && dist2 < r*r){
+        const dist = Math.sqrt(dist2);
+        const push = (r - dist);
+        const inv = 1.0 / Math.max(0.0001, dist);
+        camera.position.x += dx * inv * push;
+        camera.position.z += dz * inv * push;
+      }
+    }
+    // 首・頭・顎
+    if(p.neck){ p.neck.rotation.x = 0.1 + Math.sin(e.t*1.2 + wob)*0.08; p.neck.rotation.y = Math.sin(e.t*0.8 + i)*0.1; }
+    if(p.head){ p.head.rotation.y = Math.sin(e.t*0.7 + wob + i)*0.18; p.head.rotation.x = Math.sin(e.t*0.9 + i*0.5)*0.06; }
+    if(p.jaw){
+      const jawPulse = (Math.random()<0.004 ? 0.6 : 0.0);
+      const jawOpen = 0.18 + 0.28*(0.5+0.5*Math.sin(e.t*1.3 + wob)) + jawPulse;
+      p.jaw.rotation.x = -Math.min(0.85, jawOpen);
+    }
+  // 前肢（長い）+ 側方スプレイ（アウトワードステップ）
+  if(p.scapulaL){ p.scapulaL.rotation.z = 0.15*Math.sin(e.t*1.2 + wob)*e.shoulderRollAmp; }
+  if(p.scapulaR){ p.scapulaR.rotation.z = -0.15*Math.sin(e.t*1.2 + wob)*e.shoulderRollAmp; }
+  const splayL = Math.max(0, fL); // 前に出る局面でのみ外側へ
+  const splayR = Math.max(0, fR);
+  if(p.scapulaL){ p.scapulaL.position.x = (e.baseScapulaLX||p.scapulaL.position.x) + e.foreSplayAmp*(0.2 + 0.8*splayL); p.scapulaL.rotation.y = 0.12*splayL; }
+  if(p.scapulaR){ p.scapulaR.position.x = (e.baseScapulaRX||p.scapulaR.position.x) - e.foreSplayAmp*(0.2 + 0.8*splayR); p.scapulaR.rotation.y = -0.12*splayR; }
+  if(p.shoulderL){ p.shoulderL.position.x = 0.02 + 0.06*splayL; p.shoulderL.rotation.x = -0.9*fL*e.armAmp; }
+    if(p.elbowL){ p.elbowL.rotation.x = 0.4 + 0.7*Math.abs(fL); }
+    if(p.wristL){ p.wristL.rotation.x = -0.4*fL; }
+    if(p.clawL){ p.clawL.rotation.x = Math.max(0, -fL)*0.5; }
+  if(p.shoulderR){ p.shoulderR.position.x = -0.02 - 0.06*splayR; p.shoulderR.rotation.x = -0.9*fR*e.armAmp; }
+    if(p.elbowR){ p.elbowR.rotation.x = 0.4 + 0.7*Math.abs(fR); }
+    if(p.wristR){ p.wristR.rotation.x = -0.4*fR; }
+    if(p.clawR){ p.clawR.rotation.x = Math.max(0, -fR)*0.5; }
+    // 後肢（踵上げの趾行）
+    if(p.hipL){ p.hipL.rotation.x = 0.8*hL*e.legAmp; }
+    if(p.kneeL){ p.kneeL.rotation.x = 0.5 + 1.0*Math.abs(hL); }
+    if(p.ankleL){ p.ankleL.rotation.x = -0.6*hL; }
+    if(p.hoofL){ p.hoofL.rotation.x = Math.max(0,-hL)*0.45; }
+    if(p.hipR){ p.hipR.rotation.x = 0.8*hR*e.legAmp; }
+    if(p.kneeR){ p.kneeR.rotation.x = 0.5 + 1.0*Math.abs(hR); }
+    if(p.ankleR){ p.ankleR.rotation.x = -0.6*hR; }
+    if(p.hoofR){ p.hoofR.rotation.x = Math.max(0,-hR)*0.45; }
+    // 全体の上下バウンド
+    if(p.spineRoot){ p.spineRoot.position.y = (e.baseSpineY||p.spineRoot.position.y) + Math.abs(Math.sin(ph*2.0))*0.06; }
+    // 微痙攣を前足の爪先に少し
+    const spasm = (Math.random()<0.2) ? 0.0 : (Math.sin(e.t*40.0)*0.15);
+    if(p.wristL){ p.wristL.rotation.z += spasm*0.1; }
+    if(p.wristR){ p.wristR.rotation.z -= spasm*0.1; }
+    // 人型用処理をスキップ
+    continue;
+  }
+  // 腕: 鎖骨ロール→肩→肘→手（不気味に振幅強、肘は逆相で突っ張る瞬間）
+  if(p.clavicleL){ p.clavicleL.rotation.z = Math.sin(e.t*1.3 + i)*0.15*e.shoulderRollAmp; }
+  if(p.clavicleR){ p.clavicleR.rotation.z = -Math.sin(e.t*1.3 + i)*0.15*e.shoulderRollAmp; }
+  if(p.shoulderL){ p.shoulderL.rotation.x = strideSin * e.armAmp; p.elbowL.rotation.x = -Math.abs(Math.sin(ph*0.95))*0.65; p.wristL.rotation.x = Math.sin(ph*1.4)*0.22; }
+  if(p.shoulderR){ p.shoulderR.rotation.x = Math.sin(ph+Math.PI) * e.armAmp; p.elbowR.rotation.x = -Math.abs(Math.sin((ph+Math.PI)*0.95))*0.65; p.wristR.rotation.x = Math.sin((ph+Math.PI)*1.4)*0.22; }
+  // 脚: 股→膝→足首→足先ローリング（足のリーチを誇張）
+  if(p.hipL){ p.hipL.rotation.x = Math.sin(ph+Math.PI)*e.legAmp; p.kneeL.rotation.x = Math.abs(Math.sin(ph+Math.PI))*1.0; p.ankleL.rotation.x = -Math.sin(ph+Math.PI)*0.34; p.footL.rotation.x = -Math.max(0, Math.sin(ph+Math.PI))*0.28; }
+  if(p.hipR){ p.hipR.rotation.x = Math.sin(ph)*e.legAmp; p.kneeR.rotation.x = Math.abs(Math.sin(ph))*1.0; p.ankleR.rotation.x = -Math.sin(ph)*0.34; p.footR.rotation.x = -Math.max(0, Math.sin(ph))*0.28; }
+  // 体幹の大きなくねり + 側方スライド（spineMidも活用）
+  if(p.lowerTorso){ p.lowerTorso.rotation.y = Math.sin(ph*0.5 + wob*0.3) * 0.08; }
+  if(p.spineMid){ p.spineMid.rotation.y = -Math.sin(ph*0.45 + wob*0.25) * 0.06; p.spineMid.rotation.x = wob * 0.05; }
+  if(p.upperTorso){ p.upperTorso.rotation.y = -Math.sin(ph*0.5 + wob*0.35) * 0.1; p.upperTorso.rotation.z = e.lean + Math.sin(e.t*2.1 + wob)*0.05; p.upperTorso.rotation.x = (Math.sin(ph*0.45) + wob*0.5) * (0.03 + e.bendAmp*0.35); }
+  if(e.sideSlide && p.hips){ p.hips.position.x = Math.sin(e.t*0.9 + i*0.5) * 0.12; }
+  // 首の伸縮（瞬間的に伸び上がる）
+  e.stretchT -= dt; if(e.stretchT<=0 && Math.random()<0.005){ e.stretchT = 0.25 + Math.random()*0.35; }
+  const stretchK = e.stretchT>0 ? (0.6 + Math.sin((0.25-e.stretchT)*12.0)*0.4) : 0.0;
+  if(p.neck){ p.neck.scale.y = 1.0 + e.neckStretchAmp * (wob*0.5 + stretchK); }
+  // 頭の奇妙な追尾
+  if(p.head){ p.head.rotation.y = Math.sin(e.t*0.65 + e.headJit + wob)*0.22; p.head.rotation.x = Math.sin(e.t*1.0 + i + wob*0.7)*0.06; }
+  // 膝の過伸展（snapっぽい挙動）
+  e.kneeFlipT -= dt; if(e.kneeFlipT<=0 && Math.random()<0.006){ e.kneeFlipT = 0.18 + Math.random()*0.25; }
+  const flipK = e.kneeFlipT>0 ? (0.6 + Math.sin((0.25-e.kneeFlipT)*18.0)*0.4) : 0.0;
+  if(p.kneeL){ p.kneeL.rotation.x += flipK*0.25; }
+  if(p.kneeR){ p.kneeR.rotation.x += flipK*0.25; }
+  // 微痙攣（手首/足首）
+  e.spasmT -= dt; if(e.spasmT<=0 && Math.random()<0.01){ e.spasmT = 0.08 + Math.random()*0.14; }
+  const spasm = e.spasmT>0 ? (Math.sin(e.t*40.0)*0.25) : 0.0;
+  if(p.wristL){ p.wristL.rotation.z += spasm*0.2; }
+  if(p.wristR){ p.wristR.rotation.z -= spasm*0.2; }
+  if(p.ankleL){ p.ankleL.rotation.z += spasm*0.15; }
+  if(p.ankleR){ p.ankleR.rotation.z -= spasm*0.15; }
+  // 指のフレア（スプレー/カール）+ 微痙攣
+  function updateFingers(fingers, sideSign){
+    if(!Array.isArray(fingers)) return;
+    const flare = 0.6 + 0.4*(0.5+0.5*Math.sin(e.t*0.9 + wob));
+    for(let fi=0; fi<fingers.length; fi++){
+      const f = fingers[fi];
+      const phase = e.t*1.7 + fi*0.6 + wob*0.5;
+      const curl = 0.3 + 0.5*(0.5+0.5*Math.sin(phase));
+      const splay = (f.splayBase||0) * flare;
+      if(f.base){ f.base.rotation.z = splay; }
+      if(f.prox){ f.prox.rotation.x = -0.7*curl; }
+      if(f.midG){ f.midG.rotation.x = -0.55*curl + spasm*0.15; }
+      if(f.tipG){ f.tipG.rotation.x = -0.45*curl + spasm*0.15; }
+      // 親指は少し外側へ（fi==0）
+      if(fi===0 && f.base){ f.base.rotation.y += sideSign*0.15*(0.5+0.5*Math.sin(e.t*1.1 + i)); }
+    }
+  }
+  if(p.fingersL) updateFingers(p.fingersL, +1);
+  if(p.fingersR) updateFingers(p.fingersR, -1);
+      // ヒップの上下バウンド
+  if(p.hips){ p.hips.position.y = e.baseHipY + Math.abs(Math.sin(ph*2.0))*0.055; }
+    }
+
+  // neon flicker + occasional spark (distance-cull updates)
+    const neonRange = 140;
+    for(let i=0;i<neonMeshes.length;i++){
+      const m = neonMeshes[i]; const c = neonCtrl[i];
+      if(!inDrawChunks(m.position.x, m.position.z)){ m.visible = false; continue; }
+      m.visible = true;
+  const outage = (Math.random() < c.offProb*dt) ? 0.0 : 1.0;
+      const wave = 0.4 + 0.6*Math.abs(Math.sin(timeElapsed*c.speed + c.jitter));
+      const intensity = c.base * wave * outage;
+      if(m.material && m.material.emissiveIntensity !== undefined){ m.material.emissiveIntensity = intensity; }
+  if(c.light){ c.light.intensity = 0.6 * intensity; c.light.position.set(m.position.x, 1.2 + 0.2*Math.sin(timeElapsed*2.0), m.position.z); }
+      // try to spark occasionally when intensity rises
+      c.nextSpark -= dt;
+      if(c.nextSpark <= 0 && outage>0.0 && Math.random()<0.08){
+        c.nextSpark = 1.5 + Math.random()*3.0;
+        spawnSparkParticles(new Vector3(m.position.x, 0.6, m.position.z));
+        // play short spark sfx
+        if(audioStarted) playSparkAt(m.position);
+      }
+    }
+
+    // utility poles arcing (distance-cull)
+    const poleRange = 160;
+    for(let i=0;i<utilPoles.length;i++){
+      const p = utilPoles[i];
+      if(!inDrawChunks(p.head.position.x, p.head.position.z)){ p.light.visible=false; p.head.visible=false; continue; }
+      p.light.visible = true; p.head.visible = true;
+      const c = p.ctrl;
+      const outage = (Math.random() < c.offProb*dt) ? 0.0 : 1.0;
+      const wave = 0.6 + 0.4*Math.abs(Math.sin(timeElapsed*c.speed + c.jitter));
+      const intensity = c.base * wave * outage;
+      p.light.intensity = intensity;
+      if(p.head.material) p.head.material.emissiveIntensity = intensity*0.8;
+      c.nextSpark -= dt;
+      if(c.nextSpark <= 0 && outage>0.0 && Math.random()<0.1){
+        c.nextSpark = 1.8 + Math.random()*3.0;
+        spawnSparkParticles(new Vector3(p.head.position.x, p.head.position.y, p.head.position.z));
+        if(audioStarted) playSparkAt(p.head.position);
+      }
+    }
+
+    // simulate spark particles
+    for(let i=sparkBursts.length-1; i>=0; i--){
+      const p = sparkBursts[i];
+      const posAttr = p.geometry.getAttribute('position');
+      const velAttr = p.geometry.getAttribute('velocity');
+      const N = posAttr.count;
+      p.userData.age += dt; const life = p.userData.life;
+      const fade = Math.max(0, 1 - p.userData.age / life);
+      if(p.material) p.material.opacity = 0.8 * fade;
+      for(let j=0;j<N;j++){
+        const ix = j*3;
+        velAttr.array[ix+0] *= (1 - 0.9*dt); // horizontal damping
+        velAttr.array[ix+2] *= (1 - 0.9*dt);
+        velAttr.array[ix+1] += (-9.8) * dt; // gravity
+        posAttr.array[ix+0] += velAttr.array[ix+0] * dt;
+        posAttr.array[ix+1] += velAttr.array[ix+1] * dt;
+        posAttr.array[ix+2] += velAttr.array[ix+2] * dt;
+        // clamp to ground
+        if(posAttr.array[ix+1] < 0.02){ posAttr.array[ix+1] = 0.02; velAttr.array[ix+1] *= -0.2; }
+      }
+      posAttr.needsUpdate = true; velAttr.needsUpdate = true;
+      if(p.userData.age >= life){ scene.remove(p); sparkBursts.splice(i,1); }
+    }
+
+    // billboard the moon toward camera and keep it far
+    if(moon){
+      moon.lookAt(camera.position.x, camera.position.y, camera.position.z);
+      const dirToMoon = new THREE.Vector3(-1, 0.5, -1).normalize();
+      const baseDist = 1000;
+      moon.position.copy(camera.position).addScaledVector(dirToMoon, baseDist).setY(camera.position.y + 420);
+    }
+
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  window.addEventListener('resize', ()=>{ camera.aspect = window.innerWidth/window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); });
+  window.addEventListener('resize', sizeMiniMapCanvas);
+  // Interaction logic
+  function tryInteract(){
+    if(!highlighted) { return; }
+    const ud = highlighted.userData || {};
+    if(ud.interactable === 'pickup'){
+      armReachT = 1.0;
+      addToInventory({ kind: ud.kind, name: ud.name, color: ud.color });
+      const idx = interactables.indexOf(highlighted); if(idx>=0) interactables.splice(idx,1);
+      if(highlighted.parent) highlighted.parent.remove(highlighted);
+      highlighted = null; prompt.style.display = 'none';
+      rebuildColliders();
+      if(audioStarted){
+        const osc = audioCtx.createOscillator(); const g = audioCtx.createGain();
+        osc.type='sine'; osc.frequency.value = 880; g.gain.value = 0.0001; osc.connect(g); g.connect(audioCtx.destination);
+        const t = audioCtx.currentTime; g.gain.linearRampToValueAtTime(0.06, t+0.02); g.gain.exponentialRampToValueAtTime(0.0001, t+0.25); osc.start(); osc.stop(t+0.28);
+      }
+    } else {
+      armReachT = 1.0;
+    }
+  }
+
+  function tryUseBattery(){
+    // prefer big battery
+    const use = (kind)=>{
+      const it = inventory.find(i=>i.kind===kind && i.qty>0);
+      if(!it) return false;
+      if(kind==='battery_big'){ var add=3; } else if(kind==='battery_small'){ var add=1; } else { return false; }
+      const need = batteryMaxSegments - batterySegments; if(need<=0) return false;
+      const gain = Math.min(add, need);
+      batterySegments += gain; it.qty -= 1; if(it.qty<=0){ const idx = inventory.indexOf(it); if(idx>=0) inventory.splice(idx,1); }
+      updateBatteryUI(); renderInventory();
+      // feedback sound
+      if(audioStarted){ const o=audioCtx.createOscillator(); const g=audioCtx.createGain(); o.type='triangle'; o.frequency.value=520; g.gain.value=0.0001; o.connect(g); g.connect(audioCtx.destination); const t=audioCtx.currentTime; g.gain.linearRampToValueAtTime(0.06,t+0.02); g.gain.exponentialRampToValueAtTime(0.0001,t+0.25); o.start(); o.stop(t+0.28);}      
+      return true;
+    };
+    if(use('battery_big')) return; use('battery_small');
+  }
+})();
+  </script>
+  <script>
+    (function(){
+      const btn = document.getElementById('fullscreen-toggle');
+      const target = document.body;
+      btn.addEventListener('click', ()=>{
+        if(!document.fullscreenElement){
+          (target.requestFullscreen || target.webkitRequestFullscreen).call(target);
+        } else {
+          (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
