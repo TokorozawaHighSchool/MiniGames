@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>TKK Game Collection</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>TKK Game Collection</h1>
+
+    <!-- Title screen overlay -->
+    <div id="title-screen" class="start-screen" aria-hidden="false">
+      <div class="start-panel">
+        <h2>TKK Game Collection</h2>
+        <p style="margin-top:6px;color:var(--muted)">キーボードで操作してください。Startを押すとゲーム選択へ進みます。</p>
+        <div style="display:flex;gap:10px;justify-content:center;margin-top:18px">
+          <button id="btn-start" style="padding:12px 18px;border-radius:8px;background:var(--accent);border:none;cursor:pointer">Start</button>
+          <button id="btn-show-launcher" style="padding:12px 18px;border-radius:8px;background:#fff;border:1px solid rgba(0,0,0,0.06);cursor:pointer">Launcher</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Start screen overlay: choose a game to start -->
+    <div id="start-screen" class="start-screen" aria-hidden="true" style="display:none">
+      <div class="start-panel">
+        <h2>遊ぶゲームを選んでください</h2>
+        <div id="start-grid" class="start-grid"></div>
+        <div class="start-actions">
+          <button id="open-launcher"></button>
+        </div>
+      </div>
+    </div>
+      </div>
+    </div>
+
+    <main class="main">
+      <section class="playarea" style="flex:1">
+          <div style="position:relative;height:100%;">
+            <iframe id="game-frame" title="Game" src="about:blank" style="width:100%;height:100%;border:0"></iframe>
+            <button id="fullscreen-toggle" aria-label="フルスクリーン切替" style="position:absolute;right:12px;bottom:12px;padding:8px 10px;border-radius:6px;border:none;background:rgba(0,0,0,0.5);color:#fff;cursor:pointer">⤢</button>
+          </div>
+      </section>
+    </main>
+
+    <footer>
+      <small>ローカルで静的サーバーを立てて開発してください。</small>
+    </footer>
+  </div>
+
+  <script src="./src/launcher.js"></script>
+  <script>
+    (function(){
+      const btn = document.getElementById('fullscreen-toggle');
+      const frame = document.getElementById('game-frame');
+      function isFull(){ return document.fullscreenElement === frame || document.fullscreenElement === frame.parentElement; }
+      function updateLabel(){ btn.textContent = isFull() ? '⤢' : '⤢'; }
+      btn.addEventListener('click', ()=>{
+        const el = frame.parentElement || frame;
+        if(!document.fullscreenElement){
+          if(el.requestFullscreen) el.requestFullscreen();
+          else if(el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+        } else {
+          if(document.exitFullscreen) document.exitFullscreen();
+          else if(document.webkitExitFullscreen) document.webkitExitFullscreen();
+        }
+      });
+      document.addEventListener('fullscreenchange', updateLabel);
+    })();
+  </script>
+</body>
+</html>

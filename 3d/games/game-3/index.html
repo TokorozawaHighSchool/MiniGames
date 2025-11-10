@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Tetris (Game 3)</title>
+  <style>
+    html,body{height:100%;margin:0;background:var(--bg);color:#0f172a;font-family:Arial}
+    .wrap{display:flex;gap:18px;align-items:flex-start;padding:20px}
+    canvas{background:#071018;border:6px solid #0b1722;border-radius:6px}
+    .hud{min-width:200px}
+    button{padding:8px 10px;border-radius:6px;border:0;background:#7dd3fc;color:#012}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="left">
+      <canvas id="game" width="300" height="600" aria-label="Tetris board"></canvas>
+    </div>
+    <div class="hud">
+      <h2 style="margin-bottom:6px">Tetris</h2>
+      <div class="stat">Score: <strong id="score">0</strong></div>
+      <div class="stat">Level: <strong id="level">1</strong></div>
+      <div class="next">
+        <div style="font-size:13px;color:#9ca3af;margin-bottom:6px">Next</div>
+        <canvas id="next" width="120" height="120" style="background:#071018;border-radius:6px;border:1px solid rgba(255,255,255,0.03)"></canvas>
+      </div>
+      <div style="margin-top:12px;display:flex;gap:8px">
+  <button id="pause">Pause</button>
+  <button id="back">戻る</button>
+  <button id="fullscreen-toggle">⤢</button>
+      </div>
+      <div style="margin-top:14px;color:#9ca3af;font-size:13px">操作: ← → ↓ / X 回転 / Z 反時計回り / Space 落下</div>
+      <div id="game-over" style="margin-top:12px;color:#fb7185;display:none;font-weight:bold">Game Over</div>
+    </div>
+  </div>
+
+  <script src="./main.js"></script>
+  <script>
+    (function(){
+      const btn = document.getElementById('fullscreen-toggle');
+      const target = document.querySelector('.wrap') || document.body;
+      btn.addEventListener('click', ()=>{
+        if(!document.fullscreenElement){
+          (target.requestFullscreen || target.webkitRequestFullscreen).call(target);
+        } else {
+          (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

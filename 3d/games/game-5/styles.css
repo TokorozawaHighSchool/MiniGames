@@ -1,0 +1,6 @@
+* { box-sizing: border-box; }
+html,body { height:100%; margin:0; background:#000; font-family:system-ui,Segoe UI,Meiryo, sans-serif; }
+#overlay { position: absolute; top:10px; left:10px; color:#fff; z-index:10; }
+#startBtn { padding:10px 14px; font-size:14px; cursor:pointer; }
+#hint { margin-top:8px; font-size:13px; opacity:0.9 }
+canvas { display:block }

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>刹那の見切り（Game 1）</title>
+  <style>
+  /* 変更点: 黒背景の箇所は白文字表示に統一 */
+  html,body{height:100%;margin:0;background:var(--bg);color:#fff;font-family:system-ui, "Segoe UI", Meiryo, sans-serif}
+    #root{display:flex;align-items:center;justify-content:center;height:100%;padding:20px;box-sizing:border-box}
+    .wrap{max-width:900px;width:100%;text-align:center}
+    h2{margin:0 0 8px}
+    .status{margin:16px 0;padding:18px;border-radius:8px;background:#111;font-size:20px;color:#fff}
+    .status.go{background:#083; color:#eaffea}
+    .status.false{background:#800; color:#ffdede}
+    .meta{color:#cbd5e1; font-size:14px} /* 読みやすい薄い色に調整 */
+    .scores{display:flex;gap:12px;justify-content:center;margin-top:12px}
+    .player{background:#101018;padding:12px;border-radius:8px;min-width:180px;color:#fff}
+    .player strong{display:block;margin-bottom:6px}
+    .controls{margin-top:18px;display:flex;gap:8px;justify-content:center}
+    button{padding:8px 12px;border-radius:6px;border:0;cursor:pointer;color:#fff}
+    button#back{background:#444;color:#fff}
+    button#restart{background:#2a6;color:#fff}
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div class="wrap">
+      <h2>刹那の見切り</h2>
+
+      <div id="status" class="status">Spaceでスタート — Player1: A ／ Player2: L</div>
+      <div class="meta">見切りの合図はランダムに2〜6秒後。合図前のキーは反則（ファウル）。</div>
+
+      <div class="scores" aria-live="polite">
+        <div class="player">
+          <strong>Player1 (A)</strong>
+          <div id="p1score">Score: 0</div>
+          <div id="p1time">反応: —</div>
+        </div>
+        <div class="player">
+          <strong>Player2 (L)</strong>
+          <div id="p2score">Score: 0</div>
+          <div id="p2time">反応: —</div>
+        </div>
+      </div>
+
+      <div class="controls">
+        <button id="restart">リセットスコア</button>
+        <button id="back">戻る</button>
+  <button id="fullscreen-toggle" aria-label="フルスクリーン切替" style="padding:8px 12px;border-radius:6px;border:none;background:#222;color:#fff;cursor:pointer">⤢</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="./main.js"></script>
+  <script>
+    (function(){
+      const btn = document.getElementById('fullscreen-toggle');
+      const target = document.getElementById('root') || document.body;
+      btn.addEventListener('click', ()=>{
+        if(!document.fullscreenElement){
+          (target.requestFullscreen || target.webkitRequestFullscreen).call(target);
+        } else {
+          (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ja">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width,initial-scale=1" />
+		<title>スロットゲーム - Game 4</title>
+		<link rel="stylesheet" href="styles.css">
+		<style>
+			/* 基本スタイル：軽めに内包しておきます */
+			body { font-family: "Segoe UI", Meiryo, sans-serif; background:#0b6b3a; color:#fff; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
+			.container { width:360px; background:linear-gradient(#1b7a46,#0f5e34); padding:16px; border-radius:12px; box-shadow:0 8px 24px rgba(0,0,0,0.5); }
+			.header { text-align:center; margin-bottom:8px }
+			.coins { text-align:right; font-weight:700; }
+			.machine { background:linear-gradient(#2e8b57,#1f6d45); padding:12px; border-radius:8px; border:4px solid #cda34a }
+			.reels { display:flex; gap:8px; justify-content:center; margin:12px 0 }
+			.reel { width:92px; height:140px; background:linear-gradient(#ddd,#fff); border-radius:6px; overflow:hidden; position:relative; box-shadow:inset 0 4px 8px rgba(0,0,0,0.2); border:4px solid #8b5a2b }
+			.strip { position:absolute; width:100%; top:0; left:0; transition:transform 0.25s cubic-bezier(.2,.8,.2,1); display:flex; flex-direction:column; }
+			.symbol { height:46px; display:flex; align-items:center; justify-content:center; font-size:28px; min-width:100%; }
+			.symbol img{ width:40px; height:40px; object-fit:contain }
+			.controls { display:flex; gap:8px; justify-content:center; margin-top:8px }
+			button { padding:8px 12px; border-radius:6px; border:none; background:#f5a623; color:#222; font-weight:700; cursor:pointer; box-shadow:0 4px 0 #c17a00 }
+			.message { text-align:center; margin-top:8px; min-height:20px }
+		</style>
+	</head>
+	<body>
+		<div class="container">
+			<div class="header">
+				<h2>スロットマシン</h2>
+			</div>
+			<div class="coins">コイン: <span id="coin-count">100</span></div>
+			<div class="machine">
+				<div class="reels">
+					  <div class="reel" id="reel-0"><div class="strip" id="strip-0"></div></div>
+					  <div class="reel" id="reel-1"><div class="strip" id="strip-1"></div></div>
+					  <div class="reel" id="reel-2"><div class="strip" id="strip-2"></div></div>
+				</div>
+				<div class="controls">
+					<button id="bet-1">1 ベット</button>
+					<button id="spin">スピン</button>
+					<button id="auto">オート x5</button>
+				</div>
+				<div class="message" id="message"></div>
+			</div>
+		</div>
+		<script src="main.js"></script>
+	</body>
+</html>

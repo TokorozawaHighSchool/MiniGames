@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Game 2</title>
+  <style>
+    :root{--bg:#071122;--panel:rgba(255,255,255,0.06);--accent:#39ff14}
+    html,body{height:100%;margin:0;background:var(--bg);color:#fff;font-family:Arial,Helvetica,sans-serif}
+    #root{display:flex;flex-direction:column;height:100%}
+    .hud{display:flex;align-items:center;justify-content:space-between;padding:12px 18px;background:linear-gradient(180deg,rgba(0,0,0,0.25),transparent);border-bottom:1px solid rgba(255,255,255,0.04)}
+    .hud h2{margin:0;font-size:18px}
+    .stats span{margin:0 8px;font-weight:600}
+    .right button{margin-left:8px}
+
+    .playarea{flex:1;position:relative;overflow:hidden;display:block;background:linear-gradient(180deg,#0a1  , transparent);}
+    .controls{display:flex;align-items:center;gap:12px;padding:10px 14px;background:var(--panel);border-top:1px solid rgba(255,255,255,0.03)}
+
+  /* targets (humanoid) */
+  .target{position:absolute;width:48px;height:90px;cursor:pointer;transform:translateZ(0);transition:transform 0.12s ease, opacity 0.2s;display:flex;flex-direction:column;align-items:center}
+  .target .head{width:34px;height:34px;border-radius:50%;background:linear-gradient(180deg,#ffd9c0,#ffb79a);border:2px solid rgba(0,0,0,0.25);box-shadow:0 3px 8px rgba(0,0,0,0.4);margin-top:2px}
+  .target .body{width:22px;height:44px;background:linear-gradient(180deg,#4b87ff,#1f5fe0);border-radius:6px;margin-top:6px;box-shadow:inset 0 -6px 8px rgba(0,0,0,0.15)}
+  .target .limb{position:absolute;background:#333;border-radius:4px}
+  .target .limb.left{width:8px;height:26px;left:-12px;top:44px;transform-origin:top left}
+  .target .limb.right{width:8px;height:26px;right:-12px;top:44px;transform-origin:top right}
+  .target .limb.legL{width:8px;height:28px;left:4px;top:78px}
+  .target .limb.legR{width:8px;height:28px;right:4px;top:78px}
+  .target.hit{transform:scale(0.7) rotate(-8deg);opacity:0}
+  .head.head-hit{transform:scale(1.25);box-shadow:0 8px 18px rgba(255,200,150,0.25);filter:brightness(1.2)}
+
+    /* crosshair */
+    #crosshair{position:absolute;pointer-events:none;width:32px;height:32px;left:50%;top:50%;transform:translate(-50%,-50%);mix-blend-mode:screen}
+    #crosshair:before,#crosshair:after{content:'';position:absolute;background:var(--accent);}
+    #crosshair:before{left:50%;top:0;width:2px;height:100%;transform:translateX(-50%)}
+    #crosshair:after{top:50%;left:0;height:2px;width:100%;transform:translateY(-50%)}
+
+    /* small responsive tweaks */
+    @media (max-width:600px){.hud{padding:8px}.controls{flex-direction:column;align-items:flex-start}}
+  </style>
+</head>
+<body>
+  <div id="root">
+    <header class="hud">
+      <div class="left">
+        <h2>Aim Trainer</h2>
+      </div>
+      <div class="center">
+        <div class="stats">
+          <span id="score">Score: 0</span>
+          <span id="hits">Hits: 0</span>
+          <span id="misses">Misses: 0</span>
+        </div>
+      </div>
+      <div class="right">
+        <button id="start">Start</button>
+        <button id="reset">Reset</button>
+        <button id="back">戻る</button>
+  <button id="fullscreen-toggle" aria-label="フルスクリーン切替" style="margin-left:8px">⤢</button>
+      </div>
+    </header>
+
+    <main class="playarea" id="playarea" tabindex="0" aria-label="ゲームプレイエリア">
+      <div id="crosshair" aria-hidden="true"></div>
+      <!-- targets are appended here -->
+    </main>
+
+    <footer class="controls">
+      <label>Duration:
+        <select id="duration">
+          <option value="15">15s</option>
+          <option value="30" selected>30s</option>
+          <option value="60">60s</option>
+        </select>
+      </label>
+      <label>Difficulty:
+        <select id="difficulty">
+          <option value="easy">Easy</option>
+          <option value="normal" selected>Normal</option>
+          <option value="hard">Hard</option>
+        </select>
+      </label>
+        <label>Sensitivity:
+          <input id="sensitivity" type="range" min="0.2" max="3" step="0.1" value="1">
+          <span id="sensVal">1.0</span>
+        </label>
+      <div class="timer">Time: <span id="time">0.0</span>s</div>
+    </footer>
+  </div>
+  <script src="./main.js"></script>
+  <script>
+    (function(){
+      const btn = document.getElementById('fullscreen-toggle');
+      const target = document.getElementById('root') || document.documentElement;
+      btn.addEventListener('click', ()=>{
+        if(!document.fullscreenElement){
+          (target.requestFullscreen || target.webkitRequestFullscreen).call(target);
+        } else {
+          (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Game 6</title>
+  <style>
+    html,body{height:100%;margin:0;background:var(--bg);color:#0f172a;font-family:Arial}
+    #root{display:flex;align-items:center;justify-content:center;height:100%}
+    button{padding:8px 12px}
+    /* hide cursor over the game canvas/root during play */
+    #root canvas { cursor: none; }
+    #root { cursor: none; }
+    /* crosshair */
+    #crosshair {
+      position: fixed;
+      left: 50%;
+      top: 50%;
+      width: 32px;
+      height: 32px;
+      margin-left: -16px;
+      margin-top: -16px;
+      pointer-events: none; /* don't block clicks */
+      z-index: 9999;
+      mix-blend-mode: difference;
+    }
+    #crosshair:before, #crosshair:after {
+      content: '';
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      background: white;
+    }
+    #crosshair:before {
+      width: 2px;
+      height: 24px;
+      margin-left: -1px;
+      margin-top: -12px;
+    }
+    #crosshair:after {
+      height: 2px;
+      width: 24px;
+      margin-left: -12px;
+      margin-top: -1px;
+    }
+    /* pre-game settings overlay */
+    #settings-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 10000;
+    }
+    #settings-card {
+      background: #fff;
+      color: #0f172a;
+      border-radius: 12px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+      width: min(520px, 92vw);
+      padding: 20px 22px;
+    }
+    #settings-card h3 { margin: 0 0 12px; }
+    .field { margin-top: 12px; }
+    .row { display:flex; align-items:center; gap:10px; }
+    input[type="range"] { width: 100%; }
+    .actions { margin-top: 16px; display:flex; justify-content:flex-end; gap:10px; }
+    .btn { padding:8px 12px; border:1px solid #334155; background:#e2e8f0; border-radius:6px; cursor:pointer; }
+    .btn.primary { background:#3b82f6; color:#fff; border-color:#2563eb; }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div>
+      <h2>Game 6（テンプレート）</h2>
+      <p>ここにゲームを実装します。</p>
+  <button class="back-btn">戻る</button>
+  <button class="fullscreen-toggle" style="margin-left:8px">⤢</button>
+      </div>
+    </div>
+    <div id="ui" style="position:fixed;left:12px;top:12px;color:#0f172a;">
+      <div id="height">Height: 0</div>
+      <button id="restart" style="margin-top:8px;">Restart</button>
+      <div style="margin-top:8px">
+  <button class="back-btn">Back</button>
+  <button class="fullscreen-toggle" style="margin-left:8px">⤢</button>
+      </div>
+    </div>
+
+  <!-- crosshair overlay -->
+  <div id="crosshair" aria-hidden="true"></div>
+
+  <!-- pre-game settings overlay -->
+  <div id="settings-overlay">
+    <div id="settings-card">
+      <h3>設定</h3>
+      <div class="field">
+        <label for="sens-range">マウス感度</label>
+        <div class="row">
+          <input id="sens-range" type="range" min="0.0008" max="0.01" step="0.0002" value="0.0025">
+          <span id="sens-value">0.0025</span>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn" id="cancel-to-launcher" title="戻る">戻る</button>
+        <button class="btn primary" id="start-game">開始</button>
+      </div>
+      <div style="margin-top:8px; font-size:12px; color:#334155;">
+        ゲーム開始後、キャンバス内をクリックするとマウスロックが有効になり視点操作できます。ESCで解除。
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

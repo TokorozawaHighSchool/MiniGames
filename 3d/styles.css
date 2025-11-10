@@ -1,0 +1,42 @@
+:root{
+  --bg:#d1d5db; /* gray-300 */
+  --card:#e5e7eb; /* gray-200 */
+  --accent:#7dd3fc;
+  --muted:#374151; /* gray-700 for muted text */
+}
+*{box-sizing:border-box}
+html,body,#app{height:100%}
+body{
+  margin:0;font-family:Inter,Segoe UI,Meiryo,Helvetica,Arial,sans-serif;background:var(--bg);color:#0f172a;
+}
+.container{max-width:1100px;margin:24px auto;padding:20px}
+header h1{margin:0 0 6px 0}
+.main{display:flex;gap:20px}
+.launcher{width:260px;background:var(--card);padding:12px;border-radius:8px}
+.launcher h2{margin-top:0}
+.launcher ul{list-style:none;padding:0;margin:8px 0}
+.launcher li{padding:8px 10px;border-radius:6px;margin-bottom:8px;background:transparent;cursor:pointer;border:1px solid rgba(255,255,255,0.04)}
+.launcher li:hover{background:rgba(125,211,252,0.06)}
+.playarea{flex:1;min-height:600px;background:#f8fafc;border-radius:8px;padding:12px}
+#game-frame{width:100%;height:100%;border:0;background:#ffffff;border-radius:6px}
+footer{margin-top:12px;color:var(--muted)}
+@media (max-width:900px){.main{flex-direction:column}.launcher{width:100%}.playarea{min-height:360px}}
+
+/* Start screen overlay */
+.start-screen{position:absolute;inset:0;background:rgba(0,0,0,0.35);display:flex;align-items:center;justify-content:center;z-index:20}
+.start-panel{width:880px;max-width:94%;background:var(--card);padding:20px;border-radius:10px;border:1px solid rgba(0,0,0,0.06);box-shadow:0 8px 30px rgba(2,6,23,0.08)}
+.start-panel h2{margin-top:0}
+.start-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:12px 0}
+.start-card{background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));padding:12px;border-radius:8px;cursor:pointer;border:1px solid rgba(255,255,255,0.03);text-align:center}
+.start-card:hover{transform:translateY(-4px);box-shadow:0 6px 18px rgba(0,0,0,0.6)}
+.start-card h3{margin:6px 0 2px 0;font-size:16px}
+.start-card p{margin:0;font-size:13px;color:var(--muted)}
+.start-actions{display:flex;justify-content:flex-end;margin-top:8px}
+.start-actions button{padding:8px 12px;background:var(--accent);border:none;border-radius:6px;color:#06202b;cursor:pointer}
+
+@media (max-width:900px){.start-grid{grid-template-columns:repeat(2,1fr)}}
+
+/* Title screen specific tweaks */
+.start-screen[aria-hidden="true"]{display:none}
+.start-screen[aria-hidden="false"]{display:flex}
+.start-panel p{color:var(--muted)}

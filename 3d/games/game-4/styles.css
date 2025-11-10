@@ -1,0 +1,4 @@
+/* Basic fallback styles for game-4 (external stylesheet referenced by index.html) */
+body { margin:0; padding:0; }
+.container { max-width:400px; margin:0 auto; }
+/* keep most styling inline in index.html for now */
