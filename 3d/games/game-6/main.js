@@ -73,7 +73,7 @@ const VERT_UP_SCALE = 1.8;   // scale for upward step size (>0)
 const VERT_DOWN_SCALE = 0.7; // scale for downward step size (<0), keep small
 const MAX_DY = 2.2;          // cap per-step vertical increase to remain reachable
 // horizontal spacing & bounds
-const MIN_STEP_DIST = 3.5;    // previous ~1.2
+const MIN_STEP_DIST = 6.9;    // 50% increase from 4.6 to widen minimum spacing
 const MAX_STEP_DIST = 7.5;    // previous ~3.4
 const BOUNDS_X = 60;          // expand playable area
 const BOUNDS_Z = 40;
