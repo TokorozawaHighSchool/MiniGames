@@ -68,9 +68,15 @@ function spin(){
 				// 判定チェック
 				if(results.filter(x=>x!==undefined).length === reels.length){
 					spinning = false;
-					const payout = evaluate(results);
-					if(payout>0){ coins += payout; messageEl.textContent = `当たり! +${payout} コイン`; }
-					else { messageEl.textContent = 'はずれ'; }
+					const outcome = evaluate(results);
+					if(outcome.payout>0){
+						coins += outcome.payout;
+						// 表示用にシンボル名を整形
+						const name = outcome.name || '当たり';
+						messageEl.textContent = `${name}！ +${outcome.payout} コイン`;
+					} else {
+						messageEl.textContent = 'はずれ';
+					}
 					updateCoins();
 				}
 				return;
@@ -104,15 +110,35 @@ function spin(){
 }
 
 function evaluate(results){
-	// シンプルな配当：3つ揃いは大当たり、2つ揃いは小当たり
-	if(results[0] === results[1] && results[1] === results[2]){
-		// 7は特別
-		if(results[0] === '7️⃣') return bet * 100;
-		return bet * 10;
+	// results は各リールの最終的な img.src (パス) を含む想定
+	// シンプルルール：
+	// - 横3つ揃い: ベース配当 = bet * 20
+	//   - 'seven.svg' の3つ揃いは特別で bet * 200
+	// - 2つ揃い: bet * 3
+	// 戻り値は { payout: number, name: string }
+
+	const r0 = results[0];
+	const r1 = results[1];
+	const r2 = results[2];
+
+	const filename = (p)=> p ? p.split('/').pop() : '';
+
+	// 3つ揃い
+	if(r0 === r1 && r1 === r2){
+		const file = filename(r0);
+		if(file === 'seven.svg') return { payout: bet * 200, name: '大当たり(7!)' };
+		// 一般的な3つ揃い
+		return { payout: bet * 20, name: `${file.replace('.svg','')} 揃い` };
 	}
+
 	// 2つ揃い
-	if(results[0] === results[1] || results[1] === results[2] || results[0] === results[2]) return bet * 2;
-	return 0;
+	if(r0 === r1 || r1 === r2 || r0 === r2){
+		// どのシンボルが揃ったかを名前にする（優先順位: r1, r0, r2）
+		const file = filename(r1) || filename(r0) || filename(r2);
+		return { payout: bet * 3, name: `${file.replace('.svg','')} ダブル` };
+	}
+
+	return { payout: 0 };
 }
 
 betBtn.addEventListener('click', ()=>{
