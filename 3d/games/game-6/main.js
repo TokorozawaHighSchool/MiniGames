@@ -78,7 +78,7 @@ const MAX_STEP_DIST = 7.5;    // previous ~3.4
 const BOUNDS_X = 60;          // expand playable area
 const BOUNDS_Z = 40;
 // minimal gap between platform edges to avoid overlap/penetration (XY footprint)
-const MIN_EDGE_GAP = 0.4;
+const MIN_EDGE_GAP = 0.6;
 function makePlatform(x, y, z, w = 4, d = 2, color = 0x7b8a8b) {
 	const geo = new THREE.BoxGeometry(w, PLATFORM_THICKNESS, d);
 	const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.9, metalness: 0.05 });
@@ -90,6 +90,18 @@ function makePlatform(x, y, z, w = 4, d = 2, color = 0x7b8a8b) {
 }
 // one-by-one generation state
 let genState = null;
+// shown once when the player reaches the highest platform
+let congratsShown = false;
+// --- Time Attack state ---
+let taRunning = false;      // timer counting now
+let taFinished = false;     // finished by reaching highest platform
+let taStartTime = 0;        // performance.now()
+let taElapsedMs = 0;        // last computed elapsed
+let taBestMs = null;        // best record in ms
+try {
+	const saved = localStorage.getItem('game6_bestTimeMs');
+	if (saved !== null) taBestMs = Number(saved);
+} catch (_) {}
 function initGenState() {
 	genState = {
 		x: 0,
@@ -105,10 +117,18 @@ function generatePlatforms() {
 	platforms.length = 0;
 	// starting ground (wider)
 	makePlatform(0, 0, 0, 60, 60, 0xbcd7ff);
+	// mark first platform as ground so it doesn't block overlap checks
+	if (platforms[0]) platforms[0].isGround = true;
 	// initialize generator; do not add course platforms yet
 	initGenState();
 	// generate a full course with variability
 	bulkGenerate(140);
+	// After generation, snap the lowest platform so its bottom touches the floor
+	snapLowestPlatformToFloor();
+	// reset congrats message state
+	congratsShown = false;
+	hideCongratsUI();
+	// do not auto-start timer here; timer starts when game starts or on manual restart
 }
 
 function addNextPlatform() {
@@ -118,6 +138,8 @@ function addNextPlatform() {
 	const overlapsCandidate = (cx, cz, w, d) => {
 		const halfX = w / 2, halfZ = d / 2;
 		for (const plat of platforms) {
+			// ignore ground plane for overlap purposes
+			if (plat.isGround) continue;
 			// use top-down AABB with margin
 			const px = plat.mesh.position.x;
 			const pz = plat.mesh.position.z;
@@ -132,7 +154,7 @@ function addNextPlatform() {
 
 	// propose up to N candidates to avoid overlaps
 	let placed = false;
-	const MAX_TRIES = 16;
+	const MAX_TRIES = 48;
 	let candX = s.x, candZ = s.z, candY = s.y, candW = 3, candD = 2;
 	let dir = s.dir;
 	for (let attempt = 0; attempt < MAX_TRIES && !placed; attempt++) {
@@ -167,10 +189,25 @@ function addNextPlatform() {
 		// slight extra turn for next try
 		dir += (Math.random() * 0.8 - 0.4);
 	}
-	// fallback: if failed, still place but push slightly outward
+	// fallback: perform radial search for a non-overlapping spot; if none, skip adding
 	if (!placed) {
-		candX = Math.max(-BOUNDS_X, Math.min(BOUNDS_X, candX + Math.sign(candX) * 0.6));
-		candZ = Math.max(-BOUNDS_Z, Math.min(BOUNDS_Z, candZ + Math.sign(candZ) * 0.6));
+		const baseStep = MIN_STEP_DIST + (MAX_STEP_DIST - MIN_STEP_DIST) * 0.5;
+		const radii = [1.0, 1.2, 1.5, 1.8, 2.2];
+		for (let r of radii) {
+			const stepsAng = 16;
+			for (let k = 0; k < stepsAng && !placed; k++) {
+				const ang = dir + (k * (Math.PI * 2 / stepsAng));
+				const rx = Math.cos(ang) * baseStep * r;
+				const rz = Math.sin(ang) * baseStep * r;
+				const tx = Math.max(-BOUNDS_X, Math.min(BOUNDS_X, s.x + rx));
+				const tz = Math.max(-BOUNDS_Z, Math.min(BOUNDS_Z, s.z + rz));
+				if (!overlapsCandidate(tx, tz, candW, candD)) {
+					candX = tx; candZ = tz; placed = true; break;
+				}
+			}
+			if (placed) break;
+		}
+		if (!placed) return; // give up this step to guarantee no overlap
 	}
 	// color palette for variety
 	const PAL = [0x8b5cf6, 0x10b981, 0xf59e0b, 0x3b82f6, 0xef4444, 0x22c55e, 0x14b8a6, 0xf97316, 0x64748b, 0x4ade80];
@@ -185,6 +222,31 @@ function bulkGenerate(count = 95) { // fewer platforms to avoid crowding now tha
 }
 
 generatePlatforms();
+// prepare timer UI (best time display)
+ensureTimerUI();
+
+// Ensure the lowest non-floor platform touches the floor with its bottom face
+function snapLowestPlatformToFloor() {
+	if (platforms.length <= 1) return; // only ground exists
+	const groundY = 0; // floor top
+	// ignore index 0 (it's the floor we created first)
+	const list = platforms.slice(1);
+	// Prefer the lowest above-floor platform; otherwise pick the closest from below
+	let above = list.filter(p => p.y >= groundY + 1e-3);
+	let target;
+	if (above.length > 0) {
+		above.sort((a, b) => a.y - b.y);
+		target = above[0];
+	} else {
+		list.sort((a, b) => b.y - a.y);
+		target = list[0];
+	}
+	if (!target) return;
+	// Place target so that its bottom sits on the floor: bottom = 0 => top = PLATFORM_THICKNESS
+	target.y = PLATFORM_THICKNESS;
+	// mesh is positioned by center; we store top as y, so set center = top - thickness/2
+	target.mesh.position.y = target.y - PLATFORM_THICKNESS / 2;
+}
 
 // --- Controls ---
 const keys = {};
@@ -217,6 +279,12 @@ window.addEventListener('keydown', (e) => {
 	// add next platform (shortcut)
 	if (e.key === 'n' || e.key === 'N') {
 		addNextPlatform();
+	}
+	// reset course and player (shortcut)
+	if (e.key === 'r' || e.key === 'R') {
+		generatePlatforms();
+		respawn();
+		resetTimeAttack(true);
 	}
 });
 
@@ -282,6 +350,98 @@ document.addEventListener('mousemove', (e) => {
 let maxHeight = player.pos.y;
 player.ground = null; // current ground contact reference { plat, yTop }
 
+function showCongratsUI(message) {
+	let el = document.getElementById('congrats-msg');
+	if (!el) {
+		el = document.createElement('div');
+		el.id = 'congrats-msg';
+		el.style.position = 'fixed';
+		el.style.inset = '0';
+		el.style.display = 'flex';
+		el.style.alignItems = 'center';
+		el.style.justifyContent = 'center';
+		el.style.pointerEvents = 'none';
+		el.style.fontSize = '64px';
+		el.style.fontWeight = '900';
+		el.style.color = '#ffffff';
+		el.style.textShadow = '0 2px 8px rgba(0,0,0,0.6)';
+		el.style.opacity = '0';
+		el.style.transition = 'opacity 400ms ease';
+		el.style.whiteSpace = 'pre-line';
+		document.body.appendChild(el);
+	}
+	el.textContent = message || 'おめでとう！';
+	// fade in then out
+	requestAnimationFrame(() => { el.style.opacity = '1'; });
+	setTimeout(() => { el.style.opacity = '0'; }, 2200);
+}
+
+function hideCongratsUI() {
+	const el = document.getElementById('congrats-msg');
+	if (el) el.style.opacity = '0';
+}
+
+function ensureTimerUI() {
+	let wrap = document.getElementById('timer');
+	if (!wrap) {
+		wrap = document.createElement('div');
+		wrap.id = 'timer';
+		wrap.style.position = 'fixed';
+		wrap.style.top = '10px';
+		wrap.style.left = '10px';
+		wrap.style.padding = '6px 10px';
+		wrap.style.background = 'rgba(0,0,0,0.35)';
+		wrap.style.borderRadius = '6px';
+		wrap.style.color = '#fff';
+		wrap.style.fontFamily = 'system-ui, sans-serif';
+		wrap.style.fontWeight = '700';
+		wrap.style.fontSize = '16px';
+		wrap.style.pointerEvents = 'none';
+		wrap.innerHTML = '<div>Time: <span id="timer-current">0.00</span>s</div><div style="opacity:.9">Best: <span id="timer-best">--</span>s</div>';
+		document.body.appendChild(wrap);
+	}
+	// update best display once
+	const bestEl = document.getElementById('timer-best');
+	if (bestEl) bestEl.textContent = (taBestMs == null ? '--' : (taBestMs/1000).toFixed(2));
+}
+
+function resetTimeAttack(startNow) {
+	ensureTimerUI();
+	taFinished = false;
+	taElapsedMs = 0;
+	if (startNow) {
+		taRunning = true;
+		taStartTime = performance.now();
+	} else {
+		taRunning = false;
+	}
+	const curEl = document.getElementById('timer-current');
+	if (curEl) curEl.textContent = '0.00';
+}
+
+function updateTimeAttackUI() {
+	if (!taRunning || taFinished) return;
+	const now = performance.now();
+	taElapsedMs = now - taStartTime;
+	const curEl = document.getElementById('timer-current');
+	if (curEl) curEl.textContent = (taElapsedMs/1000).toFixed(2);
+}
+
+function finishTimeAttack() {
+	if (!taRunning || taFinished) return null;
+	taFinished = true;
+	const now = performance.now();
+	taElapsedMs = now - taStartTime;
+	// best
+	if (taBestMs == null || taElapsedMs < taBestMs) {
+		taBestMs = taElapsedMs;
+		try { localStorage.setItem('game6_bestTimeMs', String(taBestMs)); } catch (_) {}
+		const bestEl = document.getElementById('timer-best');
+		if (bestEl) bestEl.textContent = (taBestMs/1000).toFixed(2);
+	}
+	return taElapsedMs / 1000;
+}
+
 // We'll do a simple collision test manually each frame using previous-frame Y
 function checkCollisions() {
 	const pHalfX = PLAYER_SIZE.x / 2;
@@ -333,6 +493,18 @@ function checkCollisions() {
 		player.vel.y = 0;
 		player.onGround = true;
 		player.ground = { plat: bestPlat, yTop: bestTop };
+		// Show congrats if we landed on the highest non-ground platform
+		if (!congratsShown && bestPlat && !bestPlat.isGround) {
+			let highestY = -Infinity;
+			for (const p of platforms) {
+				if (p.isGround) continue;
+				if (p.y > highestY) highestY = p.y;
+			}
+			if (bestPlat.y >= highestY - 1e-6) {
+				congratsShown = true;
+				showCongratsUI();
+			}
+		}
 	} else {
 		// sticky ground: if we were grounded and still very near the same top, keep contact
 		if (player.ground && player.vel.y <= 2) {
@@ -423,6 +595,8 @@ function animate(t) {
 	if (player.pos.y > maxHeight) maxHeight = player.pos.y;
 	const heightEl = document.getElementById('height');
 	if (heightEl) heightEl.textContent = 'Height: ' + Math.max(0, Math.floor(maxHeight));
+	// update time attack UI
+	updateTimeAttackUI();
 	renderer.render(scene, camera);
 	requestAnimationFrame(animate);
 }
@@ -466,6 +640,7 @@ const restartBtn = document.getElementById('restart');
 if (restartBtn) restartBtn.addEventListener('click', () => {
 	generatePlatforms();
 	respawn();
+	resetTimeAttack(true);
 });
 
 // Next platform button
@@ -503,7 +678,6 @@ const sensRange = document.getElementById('sens-range');
 const sensValue = document.getElementById('sens-value');
 const startBtn = document.getElementById('start-game');
 const cancelBtn = document.getElementById('cancel-to-launcher');
-
 if (sensRange && sensValue) {
 	const v = Number(sensRange.value);
 	if (!Number.isNaN(v)) {
@@ -526,6 +700,7 @@ if (startBtn && overlay) {
 		// Request pointer lock immediately for smoother start
 		try { renderer.domElement.requestPointerLock(); } catch (_) {}
 		renderer.domElement.focus?.();
+		resetTimeAttack(true);
 	});
 }
 if (cancelBtn) {
