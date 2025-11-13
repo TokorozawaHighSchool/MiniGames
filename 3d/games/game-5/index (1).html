@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Forest FPS MVP</title>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="styles (1).css">
 </head>
 <body>
   <div id="overlay">
@@ -70,7 +70,9 @@
   scene.fog = new FogExp2(0x070912, 0.014);
 
   const camera = new PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 6000);
-  camera.position.set(0, 1.6, 10);
+  // 初期スポーン（後でランドマーク生成後に屋上へ再配置）
+  const spawnPoint = new THREE.Vector3(0, 1.6, 28);
+  camera.position.copy(spawnPoint);
   // Predeclare interactables & pickup group early so spawners can run before later blocks initialize
   const interactables = [];
   const pickupGroup = new Group(); scene.add(pickupGroup);
@@ -352,6 +354,39 @@
     }
     const tex = new CanvasTexture(c); tex.needsUpdate = true; return tex;
   }
+  // 屋上タイルテクスチャ
+  function makeTileTexture(w=512,h=512, cell=2){
+    const c=document.createElement('canvas'); c.width=w; c.height=h; const ctx=c.getContext('2d');
+    // ベース
+    ctx.fillStyle = '#2a2f36'; ctx.fillRect(0,0,w,h);
+    // ノイズで質感
+    const noise = makeNoiseCanvas(w,h,70,14); ctx.globalAlpha=0.25; ctx.drawImage(noise,0,0); ctx.globalAlpha=1;
+    // グリッド
+    const cols = 16, rows = 16; // 正方格子
+    ctx.strokeStyle = 'rgba(220,230,240,0.08)'; ctx.lineWidth = 1;
+    for(let i=1;i<cols;i++){ const x = Math.floor(i*w/cols)+0.5; ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }
+    for(let j=1;j<rows;j++){ const y = Math.floor(j*h/rows)+0.5; ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
+    // ランダム目地強調
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    for(let k=0;k<Math.floor(cols*0.3);k++){
+      const i = 1+Math.floor(Math.random()*(cols-1)); const x = Math.floor(i*w/cols)+0.5; ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke();
+    }
+    const tex = new CanvasTexture(c); tex.wrapS=tex.wrapT=THREE.RepeatWrapping; tex.anisotropy=4; tex.needsUpdate=true; return tex;
+  }
+  function makeHazardTexture(w=512,h=256){
+    const c=document.createElement('canvas'); c.width=w; c.height=h; const ctx=c.getContext('2d');
+    ctx.fillStyle='#20252b'; ctx.fillRect(0,0,w,h);
+    const stripeW = 28; const colors=['#f2d14a','#252525'];
+    for(let x=-w; x<w*2; x+=stripeW){
+      ctx.save(); ctx.translate(x,0); ctx.rotate(-Math.PI/6);
+      ctx.fillStyle = colors[((x/stripeW)&1)===0?0:1];
+      ctx.fillRect(0,-h, stripeW, h*3);
+      ctx.restore();
+    }
+    // 使い込まれた汚れ
+    const noise = makeNoiseCanvas(w,h,80,40); ctx.globalAlpha=0.1; ctx.drawImage(noise,0,0); ctx.globalAlpha=1;
+    const tex = new CanvasTexture(c); tex.wrapS=tex.wrapT=THREE.RepeatWrapping; tex.anisotropy=4; tex.needsUpdate=true; return tex;
+  }
   function addDecal(tex, x, z, w=6, h=2, rot=0, opacity=1){
     const mat = new MeshStandardMaterial({ map: tex, transparent: true, opacity, roughness: 0.95, metalness: 0.0 });
     mat.depthWrite = false; mat.polygonOffset = true; mat.polygonOffsetFactor = -1; mat.polygonOffsetUnits = -1;
@@ -463,6 +498,7 @@
   const towerGroup = new Group(); scene.add(towerGroup);
   const bridgeGroup = new Group(); scene.add(bridgeGroup);
   const cityTowers = [];
+  let landmarkInfo = null; // 中央ランドマーク情報
   const skybridges = [];
 
   function cloneMatWithJitter(base, lightJitter=0){
@@ -472,6 +508,97 @@
     mat.roughness = Math.min(1.0, Math.max(0.1, mat.roughness * (0.9 + Math.random()*0.2)));
     mat.metalness = Math.min(1.0, Math.max(0.0, mat.metalness * (0.9 + Math.random()*0.2)));
     return mat;
+  }
+
+  // 中心ランドマーク超高層（基準ビル）
+  function createLandmarkMegaTower(x=0, z=0){
+    const group = new Group();
+    group.position.set(x, 0, z);
+    towerGroup.add(group);
+
+  // 広いポディウム（交差点を覆う基壇）
+  const LM_SCALE = 5;
+  const podiumW = 36*LM_SCALE, podiumD = 36*LM_SCALE, podiumH = 10*LM_SCALE;
+    const podium = new Mesh(unitBox, cloneMatWithJitter(podiumTemplate, 0));
+    podium.scale.set(podiumW, podiumH, podiumD);
+    podium.position.y = podiumH * 0.5;
+    group.add(podium);
+
+    // メインシャフト（層状セグメント）
+  let width = 26*LM_SCALE, depth = 26*LM_SCALE;
+    let currentY = podiumH;
+  const segHeights = [38, 42, 36, 32, 28].map(h=>h*LM_SCALE);
+    const anchors = [];
+    const facadeTemplates = [towerTemplateWarm, towerTemplateCool];
+    for(let i=0;i<segHeights.length;i++){
+      const h = segHeights[i];
+      const seg = new Mesh(unitBox, cloneMatWithJitter(facadeTemplates[i % 2], (Math.random()*0.06)-0.03));
+      seg.scale.set(width, h, depth);
+      seg.position.y = currentY + h*0.5;
+      group.add(seg);
+      anchors.push(seg.position.y + h*0.35);
+      currentY += h;
+      width *= 0.9; depth *= 0.9;
+    }
+
+    // クラウンとスパイア
+  const capH = 20*LM_SCALE;
+    const cap = new Mesh(unitBox, cloneMatWithJitter(capTemplate, 0));
+    cap.scale.set(width*0.95, capH, depth*0.95);
+    cap.position.y = currentY + capH*0.5;
+    group.add(cap);
+    let topY = cap.position.y + capH*0.5;
+    anchors.push(cap.position.y + capH*0.4);
+
+  const spireH = 36*LM_SCALE;
+    const spire = new Mesh(spireGeo, cloneMatWithJitter(spireTemplate, 0));
+    spire.scale.set(1.4, spireH, 1.4);
+    spire.position.y = topY + spireH*0.5;
+    group.add(spire);
+    topY = spire.position.y + spireH*0.5;
+
+    // 4面ネオンストリップ
+    const faces = [0,1,2,3];
+    for(const face of faces){
+      const stripMat = neonStripBase.clone();
+      stripMat.color = new Color(neonPalette[Math.floor(Math.random()*neonPalette.length)]);
+      stripMat.opacity = 0.8;
+      const strip = new Mesh(stripGeo, stripMat);
+      strip.scale.set(Math.max(1.0, podiumW*0.14), topY*0.9, 1);
+      strip.position.y = topY*0.5;
+      switch(face){
+        case 0: strip.position.z = depth*0.5 + 0.2; break;
+        case 1: strip.position.z = -depth*0.5 - 0.2; break;
+        case 2: strip.position.x = width*0.5 + 0.2; strip.rotation.y = Math.PI/2; break;
+        default: strip.position.x = -width*0.5 - 0.2; strip.rotation.y = Math.PI/2; break;
+      }
+      group.add(strip);
+    }
+
+    // 頂部ビーコンライト（控えめ）
+  const beacon = new PointLight(0x66e0ff, 1.8, 120, 1.2);
+    beacon.castShadow = false;
+    beacon.position.set(0, topY + 6, 0);
+    group.add(beacon);
+
+    // cityTowers へ登録（コリジョン/ミニマップ用）
+  const roofRadius = Math.max(width*0.5, depth*0.5) * 0.9;
+  const info = { group, x, z, radius: Math.max(podiumW, podiumD) * 0.6, height: topY, anchors: anchors.slice(-3), roofRadius };
+    cityTowers.push(info);
+    return info;
+  }
+
+  // 指定位置の地面Yを返す（屋上対応）
+  function getGroundYAt(x, z){
+    let gy = 0;
+    if(landmarkInfo){
+      const dx = x - landmarkInfo.x, dz = z - landmarkInfo.z;
+      const r = Math.hypot(dx, dz);
+      // 屋上の有効半径（記録された値を優先）
+      const rr = (landmarkInfo.roofRadius || 12);
+      if(r < rr){ gy = Math.max(gy, landmarkInfo.height); }
+    }
+    return gy;
   }
 
   function createCompositeTower(x, z, heightBias=1.0){
@@ -580,6 +707,53 @@
     }
   }
 
+  // まず中心ランドマークを生成（他タワーは距離制約で回避）
+  landmarkInfo = createLandmarkMegaTower(0, 0);
+  // 屋上へ初期スポーン（目線高を加味してその場で立てるように）
+  if(landmarkInfo){
+    camera.position.set(landmarkInfo.x, landmarkInfo.height + 1.6, landmarkInfo.z + 2);
+  }
+  // 屋上の床とエレベーター乗り場を構築
+  // 屋上の床とエレベーター乗り場（関数定義のみ：実行はコリジョン準備後）
+  const buildRooftopForLandmark = (info)=>{
+      const deckSize = Math.max(10, (info.roofRadius||20) * 2 * 0.96);
+      // 床タイル
+      const tileTex = makeTileTexture();
+      tileTex.repeat.set(deckSize/2, deckSize/2); // 2mピッチ相当
+      const deckMat = new MeshStandardMaterial({ color:0xffffff, map: tileTex, roughness:0.92, metalness:0.08 });
+      const deck = new Mesh(new PlaneGeometry(deckSize, deckSize), deckMat);
+      deck.rotation.x = -Math.PI/2; deck.position.set(info.x, info.height + 0.03, info.z); deck.receiveShadow = true; scene.add(deck);
+      // エレベーターヘッドハウス
+      const hutW = 10, hutD = 8, hutH = 12;
+      const hutMat = new MeshStandardMaterial({ color:0x1b212a, roughness:0.65, metalness:0.45, emissive:0x142238, emissiveIntensity:0.2 });
+      const hut = new Mesh(new BoxGeometry(hutW, hutH, hutD), hutMat);
+      hut.castShadow=true; hut.receiveShadow=true;
+      const margin = 4; // 屋上端からの余白
+      const hx = info.x + (deckSize*0.5 - hutW*0.5 - margin);
+      const hz = info.z - (deckSize*0.5 - hutD*0.5 - margin);
+      hut.position.set(hx, info.height + hutH*0.5, hz); scene.add(hut);
+      // ドアパネル（発光）
+      const doorW=3.6, doorH=6.5;
+      const doorMat = new MeshStandardMaterial({ color:0x0b0e13, emissive:0x66e0ff, emissiveIntensity:0.35, roughness:0.8, metalness:0.2 });
+      const door = new Mesh(new PlaneGeometry(doorW, doorH), doorMat);
+      door.position.set(hx, info.height + 2.2 + doorH*0.5, hz + hutD*0.51); // 南面（手前）
+      scene.add(door);
+      // 乗り場前の通路（ハザードストライプ）
+      const hazTex = makeHazardTexture(); hazTex.repeat.set(1.5,0.7);
+      const walkMat = new MeshStandardMaterial({ map: hazTex, roughness:0.95, metalness:0.05 });
+      const walkway = new Mesh(new PlaneGeometry(6.0, 4.0), walkMat);
+      walkway.rotation.x = -Math.PI/2; walkway.position.set(hx, info.height + 0.035, hz + hutD*0.5 + 2.0); walkway.receiveShadow=true; scene.add(walkway);
+      // コールパネル（小型発光ボックス）
+      const panel = new Mesh(new BoxGeometry(0.24, 0.6, 0.12), new MeshStandardMaterial({ color:0x111, emissive:0x99ddff, emissiveIntensity:0.6, roughness:0.7 }));
+      panel.position.set(hx + doorW*0.5 + 0.4, door.position.y - doorH*0.2, hz + hutD*0.52); scene.add(panel);
+      // 乗り場ライト
+      const lamp = new PointLight(0x66aaff, 2.2, 22, 1.6); lamp.castShadow=false; lamp.position.set(hx, door.position.y + 1.2, hz + hutD*0.6); scene.add(lamp);
+      // 頭上ライトバー（加算）
+      const bar = new Mesh(new BoxGeometry(3.8,0.12,0.1), new MeshBasicMaterial({ color:0x77ccff, transparent:true, opacity:0.8, blending:THREE.AdditiveBlending }));
+      bar.position.set(hx, door.position.y + doorH*0.55, hz + hutD*0.55); scene.add(bar);
+      // 簡易コリジョン（ヘッドハウス）
+      const r = Math.hypot(hutW*0.5, hutD*0.5) * 0.9; addCollider(hx, hz, r);
+  };
   spawnTowerCluster(0, 0, 190, 46, 1.25);
   spawnTowerCluster(210, 90, 150, 26, 1.05);
   spawnTowerCluster(-220, 110, 150, 26, 1.1);
@@ -1582,11 +1756,22 @@
   // scrap, small batteries, big batteries
   spawnPickups(12, 8, 4);
   rebuildColliders();
+  // コリジョン準備完了後に屋上を構築し、コリジョンを更新
+  if(landmarkInfo){
+    buildRooftopForLandmark(landmarkInfo);
+    rebuildColliders();
+  }
   function resolveCollisionsXZ(pos, radius){
     const { circles, segments } = collectNearby(pos.x, pos.z, 4);
     // circle colliders
     for(let i=0;i<circles.length;i++){
       const c = circles[i];
+      // 屋上にいる間は中央ランドマークの円当たりをスキップ（押し出し防止）
+      if(landmarkInfo){
+        const onRoof = getGroundYAt(pos.x, pos.z) >= (landmarkInfo.height - 0.05);
+        const nearLandmarkCenter = Math.hypot(c.x - landmarkInfo.x, c.z - landmarkInfo.z) < Math.max(1.0, landmarkInfo.radius * 0.2);
+        if(onRoof && nearLandmarkCenter){ continue; }
+      }
       const dx = pos.x - c.x; const dz = pos.z - c.z;
       const rr = radius + c.r;
       // quick AABB-like reject to reduce sqrt calls
@@ -2043,9 +2228,17 @@
   const horizSpeed = hVel.length();
 
     velocityY += gravity*dt; camera.position.y += velocityY*dt;
-    const groundY = 0; const eyeHeight = 1.6; const targetY = groundY + eyeHeight;
-  if(camera.position.y <= targetY){ camera.position.y = targetY; velocityY = 0; grounded = true; }
-    else { grounded = false; const damping = 6.0; camera.position.y += (targetY - camera.position.y) * Math.min(1, damping*dt); }
+    const eyeHeight = 1.6;
+    const groundY = getGroundYAt(camera.position.x, camera.position.z);
+    const targetY = groundY + eyeHeight;
+    if(camera.position.y <= targetY){
+      camera.position.y = targetY; velocityY = 0; grounded = true;
+    } else {
+      grounded = false;
+      // 落下時の上下振動を抑える穏やかな追従
+      const damping = 6.0;
+      camera.position.y += (targetY - camera.position.y) * Math.min(1, damping*dt);
+    }
 
     // streetlight flicker update
     const camPos = camera.position;
