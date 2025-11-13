@@ -21,6 +21,9 @@ let spinning = false;
 
 const reels = [document.getElementById('strip-0'), document.getElementById('strip-1'), document.getElementById('strip-2')];
 
+// リールごとのコントローラ（外部から stop() を呼べる）
+const reelControllers = [null, null, null];
+
 function initReels(){
 	reels.forEach((strip)=>{
 		strip.innerHTML = '';
@@ -48,14 +51,18 @@ function spin(){
 	const results = [];
 	// 各リールをステップ単位でスクロールするアニメーションにする
 	reels.forEach((strip, idx)=>{
-		const symbolEl = strip.querySelector('.symbol');
-		const symbolHeight = symbolEl ? symbolEl.offsetHeight : 46;
-		let steps = 20 + idx*8 + Math.floor(Math.random()*12); // 総ステップ数
-		const final = SYMBOLS[Math.floor(Math.random()*SYMBOLS.length)];
-		results[idx] = undefined;
+			const symbolEl = strip.querySelector('.symbol');
+			const symbolHeight = symbolEl ? symbolEl.offsetHeight : 46;
+			// controller を使って外部から停止できるようにする
+			const controller = {};
+			controller.steps = 20 + idx*8 + Math.floor(Math.random()*12); // 総ステップ数
+			controller.stop = ()=>{ controller.steps = 0; };
+			reelControllers[idx] = controller;
+			const final = SYMBOLS[Math.floor(Math.random()*SYMBOLS.length)];
+			results[idx] = undefined;
 
-		function step(){
-			if(steps <= 0){
+			function step(){
+				if(controller.steps <= 0){
 				// 最後に中央の位置に最終絵柄をセットして終了フローを呼ぶ
 				// 中央インデックス
 				const centerIdx = Math.floor(strip.children.length/2);
@@ -95,7 +102,7 @@ function spin(){
 				strip.style.transition = 'none';
 				strip.style.transform = 'translateY(0)';
 				// 次のステップへ
-				steps--;
+				controller.steps--;
 				// ランダムに次の新しいシンボルを末尾に反映して見た目を変える
 				const img = strip.children[strip.children.length-1].querySelector('img');
 				if(img) img.src = SYMBOLS[Math.floor(Math.random()*SYMBOLS.length)];
@@ -161,4 +168,65 @@ autoBtn.addEventListener('click', ()=>{
 
 // 初期化
 updateCoins(); initReels();
+
+(function(){
+  // 次に止めるリールの0ベースインデックス（左が0）
+  let nextStopIndex = 0;
+
+  function stopReelByIndex(i){
+		// 1) reelControllers があればそれを使って停止
+		if (reelControllers[i] && typeof reelControllers[i].stop === 'function'){
+			reelControllers[i].stop();
+			return true;
+		}
+		// 2) グローバルな stopReel(index) があれば呼ぶ
+		if (typeof window.stopReel === 'function'){
+			window.stopReel(i);
+			return true;
+		}
+		// 3) reels 配列オブジェクト（.stop() を持つ）を想定
+		if (window.reels && window.reels[i] && typeof window.reels[i].stop === 'function'){
+			window.reels[i].stop();
+			return true;
+		}
+		// 4) DOM の .reel / .slot-reel 要素を一時停止する（CSS アニメーション対応）
+		const domReels = document.querySelectorAll('.reel, .slot-reel');
+		if (domReels[i]){
+			const el = domReels[i];
+			// CSS アニメーションを一時停止
+			el.style.animationPlayState = 'paused';
+			// transform で回転している場合は現在値で固定
+			const st = getComputedStyle(el);
+			if (st && st.transform && st.transform !== 'none'){
+				el.style.transform = st.transform;
+			}
+			el.dataset.stopped = 'true';
+			return true;
+		}
+		return false;
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' || e.keyCode === 32){
+      e.preventDefault();
+      if (nextStopIndex >= 3) return; // 3 リール想定
+	const ok = stopReelByIndex(nextStopIndex);
+      if (ok) nextStopIndex++;
+    }
+  });
+
+  // 新しいスピン開始時に nextStopIndex をリセットする試み
+  if (typeof window.spin === 'function'){
+		const originalSpin = window.spin;
+		window.spin = function(...args){
+			nextStopIndex = 0;
+			// spin 開始時に既存の controllers をクリア
+			for(let i=0;i<reelControllers.length;i++) reelControllers[i] = null;
+			return originalSpin.apply(this, args);
+		};
+  } else {
+    const startBtn = document.querySelector('#spin, .spin-button, #start');
+    if (startBtn) startBtn.addEventListener('click', ()=> nextStopIndex = 0);
+  }
+})();
 
