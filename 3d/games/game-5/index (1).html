@@ -1612,7 +1612,22 @@
   scene.add(moon);
 
   // --- simple collision system with 10m chunking (XZ plane)
-  const playerRadius = 0.45; // approximate camera capsule radius on ground plane
+  // プレイヤー本体（カプセル相当）
+  const player = {
+    node: new THREE.Object3D(),
+    radius: 0.45,
+    eyeOffset: 1.6,
+    velY: 0,
+    grounded: false,
+  };
+  // カメラ初期位置に合わせて本体の足元位置を設定（目線オフセットを引く）
+  player.node.position.set(
+    camera.position.x,
+    camera.position.y - player.eyeOffset,
+    camera.position.z
+  );
+  scene.add(player.node);
+  const playerRadius = player.radius; // プレイヤーの水平当たり半径
   const CHUNK_SIZE = 10; // 10 meters per chunk
   const circleColliders = []; // flat list (debug/optional)
   const segmentColliders = []; // flat list (debug/optional)
@@ -1848,7 +1863,9 @@
       if(down && !exhausted && dashCooldown<=0 && dashTime<=0 && stamina>5){ dashTime=dashDuration; dashCooldown=dashCooldownDur; }
     }
     if(down){
-      if(e.code === 'Space' || k===' ' || k==='spacebar'){ if(grounded){ velocityY = jumpSpeed; grounded=false; } }
+      if(e.code === 'Space' || k===' ' || k==='spacebar'){
+        if(player.grounded){ player.velY = jumpSpeed; player.grounded = false; }
+      }
     }
   }
   window.addEventListener('mousemove', onMouseMove);
@@ -2220,25 +2237,27 @@
   const moveStep = hVel.clone().multiplyScalar(dt);
   // tentative horizontal move with collision resolution against static colliders
   if(moveStep.x !== 0 || moveStep.z !== 0){
-    const tentative = camera.position.clone();
+    const tentative = player.node.position.clone();
     tentative.x += moveStep.x; tentative.z += moveStep.z;
     resolveCollisionsXZ(tentative, playerRadius);
-    camera.position.x = tentative.x; camera.position.z = tentative.z;
+    player.node.position.x = tentative.x; player.node.position.z = tentative.z;
   }
   const horizSpeed = hVel.length();
 
-    velocityY += gravity*dt; camera.position.y += velocityY*dt;
-    const eyeHeight = 1.6;
-    const groundY = getGroundYAt(camera.position.x, camera.position.z);
-    const targetY = groundY + eyeHeight;
-    if(camera.position.y <= targetY){
-      camera.position.y = targetY; velocityY = 0; grounded = true;
+    player.velY += gravity*dt; player.node.position.y += player.velY*dt;
+    const eyeHeight = player.eyeOffset;
+    const groundY = getGroundYAt(player.node.position.x, player.node.position.z);
+    const targetY = groundY;
+    if(player.node.position.y <= targetY){
+      player.node.position.y = targetY; player.velY = 0; player.grounded = true;
     } else {
-      grounded = false;
+      player.grounded = false;
       // 落下時の上下振動を抑える穏やかな追従
       const damping = 6.0;
-      camera.position.y += (targetY - camera.position.y) * Math.min(1, damping*dt);
+      player.node.position.y += (targetY - player.node.position.y) * Math.min(1, damping*dt);
     }
+    // カメラを本体の目線に追従
+    camera.position.set(player.node.position.x, player.node.position.y + eyeHeight, player.node.position.z);
 
     // streetlight flicker update
     const camPos = camera.position;
@@ -2362,7 +2381,7 @@
     }
     pAttr.needsUpdate = true;
 
-  const coordsEl = document.getElementById('coords'); if(coordsEl){ coordsEl.textContent = `x:${camera.position.x.toFixed(2)} y:${camera.position.y.toFixed(2)} z:${camera.position.z.toFixed(2)}`; }
+  const coordsEl = document.getElementById('coords'); if(coordsEl){ coordsEl.textContent = `x:${player.node.position.x.toFixed(2)} y:${(player.node.position.y+player.eyeOffset).toFixed(2)} z:${player.node.position.z.toFixed(2)}`; }
     const stBar = document.getElementById('stamina-bar');
     if(stBar){
       const ratio = Math.max(0, Math.min(1, stamina / staminaMax));
@@ -2465,9 +2484,9 @@
       if(p.abdomen){ p.abdomen.scale.y = 1.0 + 0.015*breath; }
     }
 
-    // --- Player vs Enemy collision (円同士) ---
-    // カメラ位置を敵半径 + playerRadius で押し戻す
-    const px = camera.position.x; const pz = camera.position.z;
+  // --- Player vs Enemy collision (円同士) ---
+  // プレイヤー本体を敵半径 + playerRadius で押し戻す
+  const px = player.node.position.x; const pz = player.node.position.z;
     for(let i=0;i<enemies.length;i++){
       const e = enemies[i]; const n = e.node;
       if(!n.visible) continue; // 遠距離非表示時は省略
@@ -2478,8 +2497,8 @@
         const dist = Math.sqrt(dist2);
         const push = (r - dist);
         const inv = 1.0 / Math.max(0.0001, dist);
-        camera.position.x += dx * inv * push;
-        camera.position.z += dz * inv * push;
+  player.node.position.x += dx * inv * push;
+  player.node.position.z += dz * inv * push;
       }
     }
     // 首・頭・顎
