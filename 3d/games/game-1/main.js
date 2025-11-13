@@ -22,6 +22,24 @@ btn.addEventListener('click', () => {
 
 (() => {
   const body = document.body;
+  const intro = document.getElementById('intro-overlay');
+  const introPanel = intro && intro.querySelector('.panel');
+  let introVisible = !!intro;
+  function hideIntro() {
+    if (!intro || !introVisible) return;
+    intro.style.display = 'none';
+    introVisible = false;
+  }
+  if (introPanel) {
+    introPanel.addEventListener('click', () => hideIntro());
+    // allow focusing and keyboard closing
+    introPanel.addEventListener('keydown', (e) => {
+      if (e.key === ' ' || e.key === 'Spacebar' || e.key === 'Space') {
+        e.preventDefault();
+        hideIntro();
+      }
+    });
+  }
   // 現在の背景色を保存しておく（ラウンド終了時に戻すため）
   const originalBg = getComputedStyle(body).backgroundColor || '';
   const statusEl = document.getElementById('status');
@@ -173,6 +191,12 @@ btn.addEventListener('click', () => {
   window.addEventListener('keydown', (e) => {
     const k = e.key.toLowerCase();
     if (k === ' ') {
+      // If intro is visible, hide it first
+      if (introVisible) {
+        hideIntro();
+        e.preventDefault();
+        return;
+      }
       // Space: ラウンド開始（idle または finished のとき）
       if (state === 'idle' || state === 'finished') {
         startRound();

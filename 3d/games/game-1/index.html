@@ -21,9 +21,19 @@
     button{padding:8px 12px;border-radius:6px;border:0;cursor:pointer;color:#fff}
     button#back{background:#444;color:#fff}
     button#restart{background:#2a6;color:#fff}
+  /* Intro overlay */
+  #intro-overlay{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.78);z-index:9999}
+  #intro-overlay .panel{max-width:560px;margin:20px;padding:20px;border-radius:12px;background:linear-gradient(180deg,#073 0%,#052 100%);color:#eaffea;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,0.6);font-size:18px;line-height:1.6}
+  #intro-overlay .panel small{display:block;margin-top:12px;color:#d6ffe0;font-size:14px}
   </style>
 </head>
 <body>
+  <div id="intro-overlay" role="dialog" aria-modal="true">
+    <div class="panel" tabindex="0">
+      <div>2人プレイゲーム<br>スペースキーでスタート<br>Player1 : Aキー　　　player2 : Lキー<br>画面緑色になったら指定キーを押す</div>
+      <small>スペースキーまたはクリックで説明を閉じます</small>
+    </div>
+  </div>
   <div id="root">
     <div class="wrap">
       <h2>刹那の見切り</h2>
