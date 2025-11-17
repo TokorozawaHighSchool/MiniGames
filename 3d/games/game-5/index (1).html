@@ -7,7 +7,25 @@
   <link rel="stylesheet" href="styles (1).css">
 </head>
 <body>
-  <div id="overlay">
+  <!-- タイトル画面（ゲーム開始前にのみ表示） -->
+  <div id="title-screen" style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:radial-gradient(circle at top,#243b6b,#050711 60%,#000);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;z-index:99999;">
+    <div style="position:fixed;left:-20%;right:-20%;height:120px;background:linear-gradient(to bottom,rgba(180,220,255,0.03),rgba(0,0,0,0));transform:translateY(-100%);animation:scan 5s linear infinite;pointer-events:none;"></div>
+    <style>
+      @keyframes scan{0%{transform:translateY(-100%);}100%{transform:translateY(120vh);}}
+    </style>
+    <div style="background:rgba(4,6,16,0.8);border-radius:12px;padding:18px 20px 16px;box-shadow:0 0 25px rgba(0,0,0,0.6);border:1px solid rgba(120,190,255,0.5);min-width:260px;backdrop-filter:blur(8px);text-align:center;">
+      <h1 style="margin:0 0 12px;font-size:32px;letter-spacing:0.08em;text-transform:uppercase;text-shadow:0 0 14px rgba(71,151,255,0.9);">Neon Rooftop Escape</h1>
+      <div style="font-size:13px;opacity:0.8;margin-bottom:32px;">Game-5 / Cyberpunk Night Walk</div>
+      <button id="title-start-btn" style="width:100%;padding:9px 10px;margin-top:4px;border-radius:8px;border:0;background:linear-gradient(90deg,#3b82f6,#22c1c3);color:#fff;font-weight:700;font-size:15px;cursor:pointer;box-shadow:0 0 14px rgba(59,130,246,0.7);">ゲームを開始する</button>
+      <div style="font-size:11px;opacity:0.8;margin-top:10px;line-height:1.6;">
+        操作: WASDで移動 / マウスで視点 / Spaceでジャンプ / Shiftでダッシュ<br>
+        E: インタラクト / I: インベントリ / M: マップ / O: 設定
+      </div>
+    </div>
+    <div style="position:fixed;left:10px;bottom:10px;font-size:11px;opacity:0.6;">TKKGamers - Game-5 Prototype</div>
+  </div>
+  <!-- ゲーム開始用オーバーレイ（タイトル開始後に表示） -->
+  <div id="overlay" style="display:none;">
   <button id="startBtn">クリックして開始（Pointer Lock）</button>
   <button id="fullscreen-toggle" aria-label="フルスクリーン切替" style="margin-left:8px">⤢</button>
   <div id="hint">WASD 移動 ・ マウスで視点 ・ Eで拾う/アクション ・ Iでインベントリ ・ Shiftでダッシュ（スタミナ消費・自動回復） ・ Mでマップ</div>
@@ -39,28 +57,61 @@
 // game-5 urban step1: asphalt ground + roads, overcast mood
 (async function(){
   let THREE;
-  try {
-    THREE = await import('./lib/three.module.js');
-  } catch(errModule){
-    console.warn('Local three.module.js import failed:', errModule);
-    const tryLoadLocalUMD = () => new Promise((resolve)=>{
-      const path = './lib/three.min.js';
-      const script = document.createElement('script');
-      script.src = path;
-      script.onload = () => resolve(window.THREE ? window.THREE : null);
-      script.onerror = () => resolve(null);
-      document.head.appendChild(script);
-      setTimeout(()=>{ resolve(window.THREE ? window.THREE : null); }, 1500);
-    });
-    const localUMD = await tryLoadLocalUMD();
-    if(localUMD){
-      THREE = localUMD;
-    } else {
-      console.warn('Local UMD not found or failed; falling back to CDN module');
-      THREE = await import('https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.module.js');
-    }
-  }
+  // ローカルのthree.jsには依存せず、常にCDNモジュールのみを使用して404やMIMEエラーを避ける
+  THREE = await import('https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.module.js');
+  // 物理エンジン cannon-es をCDNから読み込み（最小構成：地面とプレイヤー球体）
+  const CANNON = await import('https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js');
   const { Scene, PerspectiveCamera, WebGLRenderer, Color, FogExp2, DirectionalLight, AmbientLight, HemisphereLight, PlaneGeometry, MeshStandardMaterial, Mesh, Vector3, CanvasTexture, CylinderGeometry, InstancedMesh, PointLight, BoxGeometry, BufferGeometry, Points, PointsMaterial, Group, ConeGeometry, MeshBasicMaterial, DoubleSide, ShaderMaterial } = THREE;
+
+  // --- 物理ワールド（cannon-es）最小セットアップ ---
+  const world = new CANNON.World({
+    gravity: new CANNON.Vec3(0, -25, 0) // ゲーム内の gravity = -25 に揃える
+  });
+  // 地面平面（いまは単純な Plane。必要ならBoxに変更可）
+  const groundBody = new CANNON.Body({ mass: 0 });
+  groundBody.addShape(new CANNON.Plane());
+  // three.js の地面と同じく Y+ が上になるように回転（法線を +Y に）
+  groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+  world.addBody(groundBody);
+
+  // --- ゲーム状態 & タイトル制御 ---
+  const titleScreen = document.getElementById('title-screen');
+  const titleStartBtn = document.getElementById('title-start-btn');
+  const overlay = document.getElementById('overlay');
+  let gameStarted = false; // Pointer Lock 前のタイトル/チュートリアル状態
+
+  function showTitle(){
+    gameStarted = false;
+    if(titleScreen) titleScreen.style.display = 'flex';
+    if(overlay) overlay.style.display = 'none';
+  }
+
+  function showOverlayForPointerLock(){
+    if(titleScreen) titleScreen.style.display = 'none';
+    if(overlay) overlay.style.display = 'block';
+  }
+
+  // タイトルの「ゲームを開始する」ボタンと Enter キーでゲーム開始オーバーレイへ
+  if(titleStartBtn){
+    titleStartBtn.addEventListener('click', ()=>{
+      showOverlayForPointerLock();
+    });
+  }
+  window.addEventListener('keydown', (e)=>{
+    if(!gameStarted && (e.key === 'Enter' || e.code === 'Enter')){
+      showOverlayForPointerLock();
+    }
+  });
+
+  // Pointer Lock 開始ボタンを押したら本当のゲーム開始状態とみなす
+  const startBtnEl = document.getElementById('startBtn');
+  if(startBtnEl){
+    startBtnEl.addEventListener('click', ()=>{
+      gameStarted = true;
+      // overlay自体はPointer Lock用の説明としてそのままでもよいが、視界をクリアにするため非表示
+      overlay.style.display = 'none';
+    });
+  }
 
   // scene & renderer (cyberpunk midnight)
   const scene = new Scene();
@@ -685,8 +736,10 @@
   function canPlaceTower(x, z, minDist){
     for(let i=0;i<cityTowers.length;i++){
       const t = cityTowers[i];
+  // 中央ランドマーク周辺は少し広めに空けておく
+  const effectiveMin = (landmarkInfo && t === landmarkInfo) ? (minDist + 20) : minDist;
       const dx = t.x - x; const dz = t.z - z;
-      if(dx*dx + dz*dz < minDist*minDist) return false;
+  if(dx*dx + dz*dz < effectiveMin*effectiveMin) return false;
     }
     return true;
   }
@@ -716,15 +769,24 @@
   // 屋上の床とエレベーター乗り場を構築
   // 屋上の床とエレベーター乗り場（関数定義のみ：実行はコリジョン準備後）
   const buildRooftopForLandmark = (info)=>{
-      const deckSize = Math.max(10, (info.roofRadius||20) * 2 * 0.96);
+      // 屋上が広くなりすぎないよう、デッキサイズ係数を少し下げる
+      const deckSize = Math.max(10, (info.roofRadius||20) * 2 * 0.78);
       // 床タイル
       const tileTex = makeTileTexture();
       tileTex.repeat.set(deckSize/2, deckSize/2); // 2mピッチ相当
       const deckMat = new MeshStandardMaterial({ color:0xffffff, map: tileTex, roughness:0.92, metalness:0.08 });
       const deck = new Mesh(new PlaneGeometry(deckSize, deckSize), deckMat);
       deck.rotation.x = -Math.PI/2; deck.position.set(info.x, info.height + 0.03, info.z); deck.receiveShadow = true; scene.add(deck);
-      // エレベーターヘッドハウス
-      const hutW = 10, hutD = 8, hutH = 12;
+  // 物理エンジン用: 屋上デッキを薄いBoxとして追加（プレイヤーが上に乗れるように）
+  const deckHalfX = deckSize * 0.5;
+  const deckHalfZ = deckSize * 0.5;
+  const deckHalfY = 0.1; // デッキ厚み
+  const rooftopShape = new CANNON.Box(new CANNON.Vec3(deckHalfX, deckHalfY, deckHalfZ));
+  const rooftopBody = new CANNON.Body({ mass: 0, shape: rooftopShape });
+  rooftopBody.position.set(info.x, info.height, info.z);
+  world.addBody(rooftopBody);
+  // エレベーターヘッドハウス（少し小さめに）
+  const hutW = 6, hutD = 4.5, hutH = 8;
       const hutMat = new MeshStandardMaterial({ color:0x1b212a, roughness:0.65, metalness:0.45, emissive:0x142238, emissiveIntensity:0.2 });
       const hut = new Mesh(new BoxGeometry(hutW, hutH, hutD), hutMat);
       hut.castShadow=true; hut.receiveShadow=true;
@@ -751,8 +813,11 @@
       // 頭上ライトバー（加算）
       const bar = new Mesh(new BoxGeometry(3.8,0.12,0.1), new MeshBasicMaterial({ color:0x77ccff, transparent:true, opacity:0.8, blending:THREE.AdditiveBlending }));
       bar.position.set(hx, door.position.y + doorH*0.55, hz + hutD*0.55); scene.add(bar);
-      // 簡易コリジョン（ヘッドハウス）
-      const r = Math.hypot(hutW*0.5, hutD*0.5) * 0.9; addCollider(hx, hz, r);
+  // 簡易コリジョン（ヘッドハウス）
+  // 見た目に沿うよう、矩形ボックスで当たり判定を付ける（少し内側にオフセット）
+  const halfX = hutW*0.5 * 0.9;
+  const halfZ = hutD*0.5 * 0.9;
+  addBoxCollider(hx, hz, halfX, halfZ, 0);
   };
   spawnTowerCluster(0, 0, 190, 46, 1.25);
   spawnTowerCluster(210, 90, 150, 26, 1.05);
@@ -785,9 +850,10 @@
     for(let j=i+1;j<cityTowers.length;j++){
       if(bridgeConnectionCounts[i] >= 3 || bridgeConnectionCounts[j] >= 3) continue;
       const a = cityTowers[i]; const b = cityTowers[j];
-      const dx = b.x - a.x; const dz = b.z - a.z;
-      const dist = Math.sqrt(dx*dx + dz*dz);
-      if(dist < 38 || dist > 170) continue;
+  const dx = b.x - a.x; const dz = b.z - a.z;
+  const dist = Math.sqrt(dx*dx + dz*dz);
+  // 中央ランドマークを跨ぐような短い橋は作らないよう、最短距離を少し長めに設定
+  if(dist < 48 || dist > 170) continue;
       if(Math.random() > 0.55) continue;
       const anchor = chooseBridgeAnchor(a, b);
       if(!anchor) continue;
@@ -906,7 +972,14 @@
       const car = makeCar(); car.position.add(pos);
       // chance to be heavily wrecked (on side)
       if(Math.random()<0.2){ car.rotation.x = (Math.random()*2-1)*0.9; car.rotation.z = (Math.random()*2-1)*0.6; }
-      carGroup.add(car); c++;
+  carGroup.add(car);
+  // 物理エンジン用Box剛体（横倒しの車もあるので、Y方向の中心は地面付近に）
+  const halfLen = 3.6*0.5 * 0.9;
+  const halfWid = 1.6*0.5 * 0.9;
+  const halfH   = 0.8; // おおよその車高半分
+  const center = new THREE.Vector3(car.position.x, halfH, car.position.z);
+  addStaticBoxBody(center, halfLen, halfH, halfWid, car.rotation.y||0);
+  c++;
     }
   }
   spawnCarsAlongRoads(30);
@@ -955,7 +1028,14 @@
   if(onX){ b.position.x = (Math.random()*2-1)*480; b.position.z = (Math.random()<0.5? 10.5 : -10.5) + (Math.random()*2-1)*4; }
   else { b.position.z = (Math.random()*2-1)*480; b.position.x = (Math.random()<0.5? 10.5 : -10.5) + (Math.random()*2-1)*4; }
       b.rotation.y = Math.random()*Math.PI;
-      signGroup.add(b);
+  signGroup.add(b);
+  // 看板全体の占有領域を薄いBoxで近似
+  const halfX = 3.0;   // 横方向
+  const halfZ = 0.6;   // 薄さ
+  const halfY = 2.6;   // 高さ半分
+  const centerY = b.position.y + 2.6; // おおよそ地面からの高さ
+  const center = new THREE.Vector3(b.position.x, centerY, b.position.z);
+  addStaticBoxBody(center, halfX, halfY, halfZ, b.rotation.y||0);
     }
   }
   spawnBillboards(14);
@@ -1218,6 +1298,12 @@
     barDummy.rotation.z = (Math.random()*2-1)*0.12;
     const s = 0.9 + Math.random()*0.2; barDummy.scale.set(s, s, s);
     barDummy.updateMatrix(); barInst.setMatrixAt(i, barDummy.matrix);
+  // 物理エンジン用Box剛体
+  const halfX = 1.6 * 0.5 * s;
+  const halfY = 0.9 * 0.5 * s;
+  const halfZ = 0.6 * 0.5 * s;
+  const center = new THREE.Vector3(p.x, 0.45, p.z);
+  addStaticBoxBody(center, halfX, halfY, halfZ, barDummy.rotation.y||0);
   });
   barInst.castShadow = true; barInst.receiveShadow = true; scene.add(barInst);
 
@@ -1612,27 +1698,38 @@
   scene.add(moon);
 
   // --- simple collision system with 10m chunking (XZ plane)
-  // プレイヤー本体（カプセル相当）
+  // プレイヤー本体（カプセル相当）＋物理ボディ（cannon-es）
   const player = {
     node: new THREE.Object3D(),
     radius: 0.45,
     eyeOffset: 1.6,
-    velY: 0,
     grounded: false,
   };
+  // cannon-es: プレイヤー用の球体ボディ（横方向の押し出しは既存ロジックを継続利用）
+  const playerShape = new CANNON.Sphere(player.radius);
+  const playerBody = new CANNON.Body({
+    mass: 1,
+    position: new CANNON.Vec3(camera.position.x, camera.position.y - player.eyeOffset, camera.position.z),
+    shape: playerShape
+  });
+  world.addBody(playerBody);
   // カメラ初期位置に合わせて本体の足元位置を設定（目線オフセットを引く）
   player.node.position.set(
     camera.position.x,
     camera.position.y - player.eyeOffset,
     camera.position.z
   );
+  // three.js のノード位置を cannon-es のボディに合わせる初期同期
+  playerBody.position.set(player.node.position.x, player.node.position.y, player.node.position.z);
   scene.add(player.node);
   const playerRadius = player.radius; // プレイヤーの水平当たり半径
   const CHUNK_SIZE = 10; // 10 meters per chunk
   const circleColliders = []; // flat list (debug/optional)
   const segmentColliders = []; // flat list (debug/optional)
+  const boxColliders = [];     // flat list of oriented boxes
   const circleChunks = new Map(); // key:"cx,cz" -> Array<{x,z,r}>
   const segmentChunks = new Map(); // key:"cx,cz" -> Array<segment>
+  const boxChunks = new Map();     // key:"cx,cz" -> Array<box>
   const _tmpV = new THREE.Vector3();
   function toChunkCoord(v){ return Math.floor(v / CHUNK_SIZE); }
   function chunkKey(cx, cz){ return cx+','+cz; }
@@ -1655,40 +1752,82 @@
       }
     }
   }
+  function pushBoxToChunks(box){
+    const half = box.half;
+    const minX = box.cx - half.x;
+    const maxX = box.cx + half.x;
+    const minZ = box.cz - half.z;
+    const maxZ = box.cz + half.z;
+    const cminX = toChunkCoord(minX), cmaxX = toChunkCoord(maxX);
+    const cminZ = toChunkCoord(minZ), cmaxZ = toChunkCoord(maxZ);
+    for(let cz=cminZ; cz<=cmaxZ; cz++){
+      for(let cx=cminX; cx<=cmaxX; cx++){
+        const key = chunkKey(cx, cz);
+        let arr = boxChunks.get(key); if(!arr){ arr = []; boxChunks.set(key, arr); }
+        arr.push(box);
+      }
+    }
+  }
   function addCollider(x, z, r){
     const obj = { x, z, r };
     circleColliders.push(obj);
     pushCircleToChunk(obj);
   }
+  function addBoxCollider(cx, cz, halfX, halfZ, rotY=0){
+    const box = {
+      cx, cz,
+      half: { x: halfX, z: halfZ },
+      rotY,
+      cos: Math.cos(rotY),
+      sin: Math.sin(rotY)
+    };
+    boxColliders.push(box);
+    pushBoxToChunks(box);
+  }
+  // cannon-es 用: 静的Box剛体を追加するヘルパー
+  function addStaticBoxBody(center, halfX, halfY, halfZ, rotY=0){
+    const shape = new CANNON.Box(new CANNON.Vec3(halfX, halfY, halfZ));
+    const body = new CANNON.Body({ mass: 0, shape });
+    body.position.set(center.x, center.y, center.z);
+    if(rotY){
+      body.quaternion.setFromEuler(0, rotY, 0);
+    }
+    world.addBody(body);
+    return body;
+  }
   function collectNearby(posX, posZ, extraRadius=3){
   const cx = toChunkCoord(posX), cz = toChunkCoord(posZ);
   // LOAD CHUNK RADIUS is fixed to 4 as requested (pre-collected here via chunk maps)
   const range = 4; // fixed load radius
-    const circles = [];
-    const segments = [];
+  const circles = [];
+  const segments = [];
+  const boxes = [];
     for(let dz=-range; dz<=range; dz++){
       for(let dx=-range; dx<=range; dx++){
         const key = chunkKey(cx+dx, cz+dz);
         const ca = circleChunks.get(key); if(ca) circles.push(...ca);
-        const sa = segmentChunks.get(key); if(sa) segments.push(...sa);
+    const sa = segmentChunks.get(key); if(sa) segments.push(...sa);
+    const ba = boxChunks.get(key); if(ba) boxes.push(...ba);
       }
     }
-    return { circles, segments };
+  return { circles, segments, boxes };
   }
   function rebuildColliders(){
-    circleColliders.length = 0; segmentColliders.length = 0;
-    circleChunks.clear(); segmentChunks.clear();
+  circleColliders.length = 0; segmentColliders.length = 0; boxColliders.length = 0;
+  circleChunks.clear(); segmentChunks.clear(); boxChunks.clear();
     // street lamp poles (from instanced matrices if available)
+    // ポール自体は見えているオブジェクトなのでコライダーを残すが、
+    // 半径を少し小さめにして「見えない張り出し」を抑える。
     if(typeof poleInst !== 'undefined' && poleInst && typeof poleInst.count === 'number'){
       const m = new THREE.Matrix4(); const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
       const n = poleInst.count;
       for(let i=0;i<n;i++){
         poleInst.getMatrixAt(i, m); m.decompose(pos, quat, scl);
-        addCollider(pos.x, pos.z, 0.45);
+        addCollider(pos.x, pos.z, 0.3);
       }
     } else if(Array.isArray(lampPositions)){
       // fallback
-      for(const p of lampPositions){ addCollider(p.x, p.z, 0.45); }
+      for(const p of lampPositions){ addCollider(p.x, p.z, 0.3); }
     }
     // utility poles (individual meshes in utilPoles)
     if(Array.isArray(utilPoles)){
@@ -1707,25 +1846,39 @@
     } else if(Array.isArray(barricadePositions)){
       for(const bp of barricadePositions){ addCollider(bp.x, bp.z, 0.9); }
     }
-    // cars (rough sphere around car body)
+    // cars: use oriented box to approximate body footprint
     if(carGroup && carGroup.children){
-      for(const c of carGroup.children){ addCollider(c.position.x, c.position.z, 2.0); }
+      const halfX = 3.6*0.5 * 0.9; // body length half (x方向)
+      const halfZ = 1.6*0.5 * 0.9; // body width  half (z方向)
+      for(const c of carGroup.children){
+        const rotY = c.rotation.y || 0;
+        addBoxCollider(c.position.x, c.position.z, halfX, halfZ, rotY);
+      }
     }
-    // signs / billboards
+    // signs / billboards: slender box roughly matching board footprint
     if(signGroup && signGroup.children){
-      for(const s of signGroup.children){ addCollider(s.position.x, s.position.z, 2.2); }
+      const halfX = 3.0 * 0.6; // board width half
+      const halfZ = 0.4 * 0.6; // thin depth
+      for(const s of signGroup.children){
+        const rotY = s.rotation.y || 0;
+        addBoxCollider(s.position.x, s.position.z, halfX, halfZ, rotY);
+      }
     }
-    // neon panels
-    if(Array.isArray(neonMeshes)){
-      for(const n of neonMeshes){ addCollider(n.position.x, n.position.z, 1.0); }
-    }
+  // neon panels
+  // ネオンパネルはほぼ床に貼られた装飾なので、プレイヤー移動の邪魔にならないよう
+  // コライダーを付けない（見た目通り「踏んで通れる」ようにする）。
+  // if(Array.isArray(neonMeshes)){
+  //   for(const n of neonMeshes){ addCollider(n.position.x, n.position.z, 1.0); }
+  // }
     // guardrail posts (instanced)
     if(typeof postInst !== 'undefined' && postInst && typeof postInst.count === 'number'){
       const m = new THREE.Matrix4(); const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
       const n = postInst.count;
       for(let i=0;i<n;i++){
         postInst.getMatrixAt(i, m); m.decompose(pos, quat, scl);
-        addCollider(pos.x, pos.z, 0.2);
+        // ポール1本ごとの当たり判定がシビアだと「見えない出っ張り」に感じやすいので、
+        // 半径をわずかに縮小して通行スペースを少し広げる。
+        addCollider(pos.x, pos.z, 0.14);
       }
     }
     // guardrail rails (as segment capsules)
@@ -1755,18 +1908,26 @@
     }
     // composite city towers
     if(Array.isArray(cityTowers)){
-      for(const t of cityTowers){ addCollider(t.x, t.z, Math.max(3.5, t.radius)); }
-    }
-    // far towers (instanced)
-    if(typeof towerInst !== 'undefined' && towerInst && typeof towerInst.count === 'number'){
-      const m = new THREE.Matrix4(); const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
-      const n = towerInst.count;
-      for(let i=0;i<n;i++){
-        towerInst.getMatrixAt(i, m); m.decompose(pos, quat, scl);
-        const r = 0.5 * Math.hypot(scl.x, scl.z);
-        addCollider(pos.x, pos.z, Math.max(2.0, r));
+      for(const t of cityTowers){
+        // ランドマークタワーそのものは屋上を自由に歩けるよう、円コリジョンを付けない
+        if(landmarkInfo && t === landmarkInfo) continue;
+        // それ以外のビルは見た目より少し内側に当たりを置くイメージで、半径を絞る
+        const baseR = (t.radius || 8);
+        addCollider(t.x, t.z, Math.max(2.0, baseR * 0.25));
       }
     }
+    // far towers (instanced)
+    // 遠景の高層ビル群は完全に背景とみなし、当たり判定を付けない。
+    // これにより、視界上はビルが見えていても、手前の実オブジェクトまでしか壁がない挙動になる。
+    // if(typeof towerInst !== 'undefined' && towerInst && typeof towerInst.count === 'number'){
+    //   const m = new THREE.Matrix4(); const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
+    //   const n = towerInst.count;
+    //   for(let i=0;i<n;i++){
+    //     towerInst.getMatrixAt(i, m); m.decompose(pos, quat, scl);
+    //     const r = 0.5 * Math.hypot(scl.x, scl.z);
+    //     addCollider(pos.x, pos.z, Math.max(0.5, r * 0.3));
+    //   }
+    // }
   }
   // scrap, small batteries, big batteries
   spawnPickups(12, 8, 4);
@@ -1777,7 +1938,7 @@
     rebuildColliders();
   }
   function resolveCollisionsXZ(pos, radius){
-    const { circles, segments } = collectNearby(pos.x, pos.z, 4);
+    const { circles, segments, boxes } = collectNearby(pos.x, pos.z, 4);
     // circle colliders
     for(let i=0;i<circles.length;i++){
       const c = circles[i];
@@ -1800,7 +1961,7 @@
         pos.x += nx * penetration; pos.z += nz * penetration;
       }
     }
-    // segment capsule colliders (guardrails)
+  // segment capsule colliders (guardrails)
     for(let i=0;i<segments.length;i++){
       const s = segments[i];
       // coarse reject using segment AABB expanded by radius
@@ -1825,6 +1986,37 @@
         pos.x += nx * penetration; pos.z += nz * penetration;
       }
     }
+    // oriented box colliders (for rectangular objects)
+    for(let i=0;i<boxes.length;i++){
+      const b = boxes[i];
+      // ローカル空間へ変換（ボックス中心を原点、Y軸回転のみ）
+      const relX = pos.x - b.cx;
+      const relZ = pos.z - b.cz;
+      const lx =  b.cos*relX + b.sin*relZ;
+      const lz = -b.sin*relX + b.cos*relZ;
+      const hx = b.half.x + radius;
+      const hz = b.half.z + radius;
+      // AABB 内にいなければ無視
+      if(Math.abs(lx) > hx || Math.abs(lz) > hz) continue;
+      // 4面のうち一番近い面から押し出す
+      const dx = hx - Math.abs(lx);
+      const dz = hz - Math.abs(lz);
+      let nx, nz, depth;
+      if(dx < dz){
+        depth = dx;
+        nx = (lx > 0) ? 1 : -1;
+        nz = 0;
+      } else {
+        depth = dz;
+        nx = 0;
+        nz = (lz > 0) ? 1 : -1;
+      }
+      // ローカル法線をワールドに戻して押し出し
+      const wx =  b.cos*nx - b.sin*nz;
+      const wz =  b.sin*nx + b.cos*nz;
+      pos.x += wx * depth;
+      pos.z += wz * depth;
+    }
     return pos;
   }
 
@@ -1835,11 +2027,112 @@
   const speed = 8.0;
   const hVel = new Vector3(0,0,0);
   const accel = 40.0, deccel = 30.0;
-  let velocityY = 0; const gravity = -25.0; const jumpSpeed = 10.0; let grounded = false;
+  const jumpSpeed = 10.0;
   let dashTime = 0; const dashDuration = 0.18; let dashCooldown = 0; const dashCooldownDur = 0.8; const dashMultiplier = 1.0; // 新ダッシュ=旧歩行
   let stamina = 100.0; const staminaMax = 100.0; const staminaUseRate = 6.0; const staminaRegenRate = 18.0; let health = 100.0; const healthMax=100.0; let dashHeld=false;
   // スタミナ枯渇時の鈍足・ダッシュ不可状態
   let exhausted = false; const slowMultiplier = 0.5;
+
+  // --- チェックポイントと落下ダメージ ---
+  // 初期スポーン位置をチェックポイントとして保持
+  const checkpoint = {
+    x: camera.position.x,
+    y: camera.position.y,
+    z: camera.position.z,
+  };
+  // 落下ダメージ計算用（距離ベース）
+  let lastVelY = 0;                // 前フレームの縦速度（演出用に保持）
+  let fallStartY = null;           // 落下開始時の高さ（playerBody.position.y ベース）
+  const lethalFallHeight = 20.0;   // 20m 以上の落下で即死
+  const stunFallHeight   = 4.0;    // 4m 以上の落下で一瞬膠着
+  const fallDamageScale  = 3.0;    // 致死未満の落下に対するダメージスケール
+  let isDead = false;
+
+  function applyDamage(amount){
+    health = Math.max(0, health - amount);
+    // UI 側のバー更新は後段の updateHealthUI で行われる
+  }
+
+  function reviveAtCheckpoint(){
+    // HP/スタミナ全回復し、プレイヤーをチェックポイントへ戻す
+    health = healthMax;
+    stamina = staminaMax;
+    exhausted = false;
+  player.grounded = false;
+    // player.node は足元座標なので、カメラ位置から eyeOffset を引いてセット
+    player.node.position.set(
+      checkpoint.x,
+      checkpoint.y - player.eyeOffset,
+      checkpoint.z
+    );
+    camera.position.set(checkpoint.x, checkpoint.y, checkpoint.z);
+    isDead = false;
+    // ポインタロックを解除し、『クリックして開始』オーバーレイを再び表示
+    if(document.pointerLockElement === document.body){
+      document.exitPointerLock();
+    }
+    if(overlay){ overlay.style.display = 'block'; }
+    gameStarted = false;
+  }
+
+  // --- 死亡演出用 UI と三人称カメラ ---
+  let deathCameraOffset = new THREE.Vector3(0, 6, 10);
+  let deathFocusPos = new THREE.Vector3();
+  let deathOverlayVisible = false;
+
+  const deathOverlay = document.createElement('div');
+  Object.assign(deathOverlay.style, {
+    position:'fixed', inset:'0', display:'none', alignItems:'center', justifyContent:'center',
+    background:'rgba(0,0,0,0.7)', zIndex:10000, color:'#fff'
+  });
+  const deathPanel = document.createElement('div');
+  Object.assign(deathPanel.style, {
+    background:'rgba(20,22,26,0.95)', padding:'16px 20px', borderRadius:'10px',
+    minWidth:'280px', textAlign:'center', boxShadow:'0 8px 24px rgba(0,0,0,0.6)'
+  });
+  deathPanel.innerHTML = `
+    <div style="font-size:20px;font-weight:800;margin-bottom:12px">死亡しました</div>
+    <div style="font-size:13px;opacity:0.85;margin-bottom:16px">タイトルに戻るか、チェックポイントから再開します。</div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button id="btn-respawn" style="padding:8px 10px;border-radius:6px;border:0;background:#3b7cff;color:#fff;font-weight:600;cursor:pointer">チェックポイントから再開</button>
+      <button id="btn-title" style="padding:8px 10px;border-radius:6px;border:0;background:#555;color:#fff;cursor:pointer">タイトルに戻る</button>
+    </div>
+  `;
+  deathOverlay.appendChild(deathPanel);
+  document.body.appendChild(deathOverlay);
+
+  const btnRespawn = deathPanel.querySelector('#btn-respawn');
+  const btnTitle = deathPanel.querySelector('#btn-title');
+
+  function showDeathOverlay(){
+    deathOverlayVisible = true;
+    deathOverlay.style.display = 'flex';
+    // ポインタロックが掛かっている場合は解除してマウス操作を可能にする
+    if(document.pointerLockElement === document.body){
+      document.exitPointerLock();
+    }
+  }
+
+  function hideDeathOverlay(){
+    deathOverlayVisible = false;
+    deathOverlay.style.display = 'none';
+  }
+
+  if(btnRespawn){
+    btnRespawn.addEventListener('click', ()=>{
+      hideDeathOverlay();
+      reviveAtCheckpoint();
+    });
+  }
+  if(btnTitle){
+    btnTitle.addEventListener('click', ()=>{
+  // 別HTMLへ遷移せず、この index(1).html 内のタイトル状態へ戻す
+  hideDeathOverlay();
+  // プレイヤーをチェックポイントに戻しつつ、再度タイトル画面からやり直せるようにする
+  reviveAtCheckpoint();
+  showTitle();
+    });
+  }
 
   function onMouseMove(e){
     if(document.pointerLockElement !== document.body) return;
@@ -1864,7 +2157,11 @@
     }
     if(down){
       if(e.code === 'Space' || k===' ' || k==='spacebar'){
-        if(player.grounded){ player.velY = jumpSpeed; player.grounded = false; }
+        if(player.grounded){
+          // 物理ボディにジャンプ速度を与える
+          playerBody.velocity.y = jumpSpeed;
+          player.grounded = false;
+        }
       }
     }
   }
@@ -2202,7 +2499,29 @@
     requestAnimationFrame(animate);
     const dt = Math.min(0.05, clock.getDelta());
     timeElapsed += dt;
-    const forward = new Vector3(); camera.getWorldDirection(forward); forward.y=0; forward.normalize();
+    // 死亡中は入力による移動を止め、死亡地点を俯瞰する三人称カメラに切り替える
+    if(isDead){
+      // 死亡地点（プレイヤー足元＋少し上）を注視点として記録
+      deathFocusPos.set(
+        player.node.position.x,
+        player.node.position.y + player.eyeOffset * 0.5,
+        player.node.position.z
+      );
+      const desiredPos = deathFocusPos.clone().add(deathCameraOffset);
+      // カメラを少しスムーズに追従させる
+      camera.position.lerp(desiredPos, 0.1);
+      camera.lookAt(deathFocusPos);
+      if(!deathOverlayVisible){
+        showDeathOverlay();
+      }
+      // 死亡中はここで早期リターン（敵やエフェクトの更新は続行したければここを調整）
+      return;
+    }
+
+  // 物理ワールドを進める（最小構成：プレイヤー球体＋地面）
+  world.step(1/60, dt, 3);
+
+  const forward = new Vector3(); camera.getWorldDirection(forward); forward.y=0; forward.normalize();
     const right = new Vector3().crossVectors(forward, new Vector3(0,1,0)).normalize();
 
   // スタミナと速度倍率（ダッシュ／疲労）
@@ -2244,20 +2563,57 @@
   }
   const horizSpeed = hVel.length();
 
-    player.velY += gravity*dt; player.node.position.y += player.velY*dt;
-    const eyeHeight = player.eyeOffset;
-    const groundY = getGroundYAt(player.node.position.x, player.node.position.z);
-    const targetY = groundY;
-    if(player.node.position.y <= targetY){
-      player.node.position.y = targetY; player.velY = 0; player.grounded = true;
-    } else {
-      player.grounded = false;
-      // 落下時の上下振動を抑える穏やかな追従
-      const damping = 6.0;
-      player.node.position.y += (targetY - player.node.position.y) * Math.min(1, damping*dt);
+  // --- 垂直移動と落下ダメージ検出（距離ベース） ---
+  // 垂直方向の位置は cannon-es のプレイヤー剛体に任せる
+  lastVelY = playerBody.velocity.y; // 前フレーム速度（演出用）
+  // 横移動後の XZ を物理ボディに反映（縦Yは物理側に任せる）
+  playerBody.position.x = player.node.position.x;
+  playerBody.position.z = player.node.position.z;
+  const bodyY = playerBody.position.y;
+
+  // 落下開始位置の記録
+  if(player.grounded){
+    // 接地状態から離れた瞬間に記録したいので、ここではリセットのみ
+    if(fallStartY === null) fallStartY = bodyY;
+  }
+
+  // 簡易接地判定：bodyY がほぼ 0（地面）に近ければ接地とみなす
+  const groundY = getGroundYAt(player.node.position.x, player.node.position.z);
+  const targetY = groundY;
+  const onGround = bodyY <= targetY + 0.05;
+
+  if(onGround){
+    if(!player.grounded && fallStartY !== null){
+      const fallDist = Math.max(0, fallStartY - targetY);
+
+      if(fallDist >= lethalFallHeight){
+        applyDamage(healthMax);
+        if(!isDead){
+          isDead = true;
+        }
+      } else if(fallDist >= stunFallHeight){
+        const over = fallDist - stunFallHeight;
+        const dmg = over * fallDamageScale;
+        applyDamage(dmg);
+        // 水平速度を一瞬弱めて "止まった" 感を出す
+        hVel.multiplyScalar(0.2);
+      }
     }
-    // カメラを本体の目線に追従
-    camera.position.set(player.node.position.x, player.node.position.y + eyeHeight, player.node.position.z);
+    fallStartY = null;
+    player.grounded = true;
+  } else {
+    if(player.grounded){
+      // 接地から離れた瞬間に高さを記録
+      fallStartY = bodyY;
+    }
+    player.grounded = false;
+  }
+
+  // world.step 後の物理ボディの Y を three.js のプレイヤーに反映
+  player.node.position.y = bodyY;
+  const eyeHeight = player.eyeOffset;
+  // カメラを本体の目線に追従
+  camera.position.set(player.node.position.x, player.node.position.y + eyeHeight, player.node.position.z);
 
     // streetlight flicker update
     const camPos = camera.position;
