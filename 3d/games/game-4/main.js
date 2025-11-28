@@ -76,14 +76,20 @@ function spin(){
 				if(results.filter(x=>x!==undefined).length === reels.length){
 					spinning = false;
 					const outcome = evaluate(results);
-					if(outcome.payout>0){
-						coins += outcome.payout;
-						// 表示用にシンボル名を整形
-						const name = outcome.name || '当たり';
-						messageEl.textContent = `${name}！ +${outcome.payout} コイン`;
-					} else {
-						messageEl.textContent = 'はずれ';
-					}
+							if(outcome.payout>0){
+								coins += outcome.payout;
+								// 表示用にシンボル名を整形
+								const name = outcome.name || '当たり';
+								// ビッグウィン演出: 大当たり（3つ揃い）なら body に .big-win を付与
+								if(outcome.bigWin){
+									document.body.classList.add('big-win');
+									// 3秒後に演出を解除
+									setTimeout(()=> document.body.classList.remove('big-win'), 3000);
+								}
+								messageEl.textContent = `${name}！ +${outcome.payout} コイン`;
+							} else {
+								messageEl.textContent = 'はずれ';
+							}
 					updateCoins();
 				}
 				return;
@@ -116,37 +122,7 @@ function spin(){
 	});
 }
 
-function evaluate(results){
-	// results は各リールの最終的な img.src (パス) を含む想定
-	// シンプルルール：
-	// - 横3つ揃い: ベース配当 = bet * 20
-	//   - 'seven.svg' の3つ揃いは特別で bet * 200
-	// - 2つ揃い: bet * 3
-	// 戻り値は { payout: number, name: string }
 
-	const r0 = results[0];
-	const r1 = results[1];
-	const r2 = results[2];
-
-	const filename = (p)=> p ? p.split('/').pop() : '';
-
-	// 3つ揃い
-	if(r0 === r1 && r1 === r2){
-		const file = filename(r0);
-		if(file === 'seven.svg') return { payout: bet * 200, name: '大当たり(7!)' };
-		// 一般的な3つ揃い
-		return { payout: bet * 20, name: `${file.replace('.svg','')} 揃い` };
-	}
-
-	// 2つ揃い
-	if(r0 === r1 || r1 === r2 || r0 === r2){
-		// どのシンボルが揃ったかを名前にする（優先順位: r1, r0, r2）
-		const file = filename(r1) || filename(r0) || filename(r2);
-		return { payout: bet * 3, name: `${file.replace('.svg','')} ダブル` };
-	}
-
-	return { payout: 0 };
-}
 
 betBtn.addEventListener('click', ()=>{
 	bet = Math.min(coins, bet+1);
@@ -169,11 +145,65 @@ autoBtn.addEventListener('click', ()=>{
 // 初期化
 updateCoins(); initReels();
 
-(function(){
-  // 次に止めるリールの0ベースインデックス（左が0）
-  let nextStopIndex = 0;
+function evaluate(results){
+	// 新ルール:
+	// - 判定対象は画面に見えている3x3（各リールの top/center/bottom のみ）
+	// - 横方向の3つ（上段／中段／下段）のいずれかが同一であれば配当を与える
+	// - 縦揃い、全9揃い、中央のみ以外の部分は無視する
 
-  function stopReelByIndex(i){
+	// normalize filename: remove query/hash and lowercase to avoid mismatches
+	const filename = (p)=> {
+		if(!p) return null;
+		const base = p.split('/').pop();
+		// strip query/hash
+		const qIdx = base.indexOf('?');
+		const hIdx = base.indexOf('#');
+		let end = base.length;
+		if(qIdx!==-1) end = Math.min(end, qIdx);
+		if(hIdx!==-1) end = Math.min(end, hIdx);
+		return base.slice(0,end).toLowerCase();
+	};
+	const DEBUG_EVAL = false; // true にすると visibleBasenames を console.debug 出力します
+
+	// visibleGrid[col][row] = src (row: 0=top,1=center,2=bottom)
+	const visibleGrid = [];
+	for(let col=0; col<3; col++){
+		const strip = document.getElementById(`strip-${col}`);
+		if(!strip){ visibleGrid.push([null,null,null]); continue; }
+		const children = Array.from(strip.children);
+		const centerIdx = Math.floor(children.length/2);
+		const top = children[centerIdx-1] ? (children[centerIdx-1].querySelector('img') || {}).src : null;
+		const center = children[centerIdx] ? (children[centerIdx].querySelector('img') || {}).src : null;
+		const bottom = children[centerIdx+1] ? (children[centerIdx+1].querySelector('img') || {}).src : null;
+		visibleGrid.push([top, center, bottom]);
+	}
+
+	// 横の3行をそれぞれチェック（rowIndex 0..2）
+	// 比較は src の文字列全体ではなくファイル名（basename）で行う
+	const visibleBasenames = visibleGrid.map(col => col.map(src => src ? filename(src) : null));
+	// デバッグ出力（ローカルでの確認用）
+	if(DEBUG_EVAL) console.debug('visibleBasenames:', visibleBasenames);
+	for(let row=0; row<3; row++){
+		const a = visibleBasenames[0][row];
+		const b = visibleBasenames[1][row];
+		const c = visibleBasenames[2][row];
+		if(a && b && c && a === b && b === c){
+			// 七の横3揃いは大当たり
+			if(a === 'seven.svg') return { payout: bet * 200, name: `横${row+1}段 大当たり(7!)`, bigWin: true };
+			// 一般の横3揃い
+			return { payout: bet * 30, name: `横${row+1}段 ${a.replace('.svg','')} 揃い`, bigWin: true };
+		}
+	}
+
+	// 2つ揃いや縦揃いは無視する（仕様により）。
+	return { payout: 0 };
+}
+
+(function(){
+	// 次に止めるリールの0ベースインデックス（左が0）
+	let nextStopIndex = 0;
+
+	function stopReelByIndex(i){
 		// 1) reelControllers があればそれを使って停止
 		if (reelControllers[i] && typeof reelControllers[i].stop === 'function'){
 			reelControllers[i].stop();
@@ -204,19 +234,19 @@ updateCoins(); initReels();
 			return true;
 		}
 		return false;
-  }
+	}
 
-  window.addEventListener('keydown', (e) => {
-    if (e.code === 'Space' || e.keyCode === 32){
-      e.preventDefault();
-      if (nextStopIndex >= 3) return; // 3 リール想定
-	const ok = stopReelByIndex(nextStopIndex);
-      if (ok) nextStopIndex++;
-    }
-  });
+	window.addEventListener('keydown', (e) => {
+		if (e.code === 'Space' || e.keyCode === 32){
+			e.preventDefault();
+			if (nextStopIndex >= 3) return; // 3 リール想定
+			const ok = stopReelByIndex(nextStopIndex);
+			if (ok) nextStopIndex++;
+		}
+	});
 
-  // 新しいスピン開始時に nextStopIndex をリセットする試み
-  if (typeof window.spin === 'function'){
+	// 新しいスピン開始時に nextStopIndex をリセットする試み
+	if (typeof window.spin === 'function'){
 		const originalSpin = window.spin;
 		window.spin = function(...args){
 			nextStopIndex = 0;
@@ -224,9 +254,9 @@ updateCoins(); initReels();
 			for(let i=0;i<reelControllers.length;i++) reelControllers[i] = null;
 			return originalSpin.apply(this, args);
 		};
-  } else {
-    const startBtn = document.querySelector('#spin, .spin-button, #start');
-    if (startBtn) startBtn.addEventListener('click', ()=> nextStopIndex = 0);
-  }
+	} else {
+		const startBtn = document.querySelector('#spin, .spin-button, #start');
+		if (startBtn) startBtn.addEventListener('click', ()=> nextStopIndex = 0);
+	}
 })();
 
