@@ -1937,8 +1937,19 @@
     buildRooftopForLandmark(landmarkInfo);
     rebuildColliders();
   }
+  // ストーリー必須アイテムをスポーン
+  spawnStoryItems();
   function resolveCollisionsXZ(pos, radius){
     const { circles, segments, boxes } = collectNearby(pos.x, pos.z, 4);
+    // 空中クリアランス判定：ジャンプ中に一定高さ以上なら側面衝突を緩和
+    let airClear = false;
+    try{
+      const bodyY = (playerBody && playerBody.position && playerBody.position.y) || 0;
+      const groundY = getGroundYAt(pos.x, pos.z);
+      const airborne = (typeof player!=='undefined' && player && player.grounded===false);
+      // 0.6m 以上浮いていれば、低い柵やコーンは越えられる前提で側面コリジョンをスキップ
+      airClear = airborne && (bodyY - groundY) > 0.6;
+    }catch(e){}
     // circle colliders
     for(let i=0;i<circles.length;i++){
       const c = circles[i];
@@ -1962,6 +1973,7 @@
       }
     }
   // segment capsule colliders (guardrails)
+    if(!airClear){
     for(let i=0;i<segments.length;i++){
       const s = segments[i];
       // coarse reject using segment AABB expanded by radius
@@ -1985,9 +1997,11 @@
         const penetration = rr - d;
         pos.x += nx * penetration; pos.z += nz * penetration;
       }
-    }
+  }
+  }
     // oriented box colliders (for rectangular objects)
-    for(let i=0;i<boxes.length;i++){
+  if(!airClear){
+  for(let i=0;i<boxes.length;i++){
       const b = boxes[i];
       // ローカル空間へ変換（ボックス中心を原点、Y軸回転のみ）
       const relX = pos.x - b.cx;
@@ -2016,18 +2030,40 @@
       const wz =  b.sin*nx + b.cos*nz;
       pos.x += wx * depth;
       pos.z += wz * depth;
-    }
+  }
+  }
     return pos;
   }
 
+  // --- Debug: collider visualization ---
+  const debugGroup = new Group(); scene.add(debugGroup);
+  let showColliders = false;
+  function setShowColliders(v){ showColliders = !!v; debugGroup.visible = showColliders; }
+  setShowColliders(false);
+
   // player movement (pointer lock FPS)
   let pitch = 0, yaw = 0;
+  // ポーズ管理（オーバーレイ表示中はゲーム停止&カーソル復活）
+  let isPaused = false;
+  function pauseGame(){
+    isPaused = true;
+    if(document.pointerLockElement === document.body){
+      document.exitPointerLock();
+    }
+  }
+  function resumeGame(){
+    isPaused = false;
+    document.body.requestPointerLock();
+  }
   const velocity = new Vector3(0,0,0);
   const move = { forward:false, back:false, left:false, right:false };
   const speed = 8.0;
   const hVel = new Vector3(0,0,0);
   const accel = 40.0, deccel = 30.0;
   const jumpSpeed = 10.0;
+  // 連続ジャンプ防止用のクールダウン
+  let jumpCooldown = 0.0;
+  const jumpCooldownDur = 0.2; // 秒
   let dashTime = 0; const dashDuration = 0.18; let dashCooldown = 0; const dashCooldownDur = 0.8; const dashMultiplier = 1.0; // 新ダッシュ=旧歩行
   let stamina = 100.0; const staminaMax = 100.0; const staminaUseRate = 6.0; const staminaRegenRate = 18.0; let health = 100.0; const healthMax=100.0; let dashHeld=false;
   // スタミナ枯渇時の鈍足・ダッシュ不可状態
@@ -2149,6 +2185,7 @@
   if(k==='i' && down){ toggleInventory(); }
   if(k==='e' && down){ tryInteract(); }
   if(k==='r' && down){ tryUseBattery(); }
+  if(k==='h' && down){ setShowColliders(!showColliders); }
     // Shift の押下/解放を常に反映（keyupでも反映されるように）
     if(e.code === 'ShiftLeft' || e.code === 'ShiftRight' || e.key === 'Shift'){
       dashHeld = down;
@@ -2157,10 +2194,13 @@
     }
     if(down){
       if(e.code === 'Space' || k===' ' || k==='spacebar'){
-        if(player.grounded){
+        // 接地かつ垂直速度がほぼゼロ、かつジャンプクールダウン無しのときのみジャンプ
+        const canJump = player.grounded && Math.abs(playerBody.velocity.y) < 0.05 && jumpCooldown<=0;
+        if(canJump){
           // 物理ボディにジャンプ速度を与える
           playerBody.velocity.y = jumpSpeed;
           player.grounded = false;
+          jumpCooldown = jumpCooldownDur;
         }
       }
     }
@@ -2196,28 +2236,98 @@
   const prompt = document.createElement('div');
   Object.assign(prompt.style, { position:'fixed', left:'50%', top:'calc(50% + 18px)', transform:'translateX(-50%)', color:'#fff', background:'rgba(0,0,0,0.55)', padding:'4px 8px', borderRadius:'6px', fontSize:'13px', zIndex:9998, pointerEvents:'none', display:'none' });
   document.body.appendChild(prompt);
-  // Inventory overlay
-  let inventoryVisible = false; const inventory = [];
+  // 脱出ゲート（シェルター）
+  const gateGeo = new THREE.BoxGeometry(1.8, 2.2, 0.2);
+  const gateMat = new THREE.MeshStandardMaterial({ color: 0x8899aa, emissive: 0x000000, roughness: 0.7, metalness: 0.2 });
+  const gate = new THREE.Mesh(gateGeo, gateMat); gate.castShadow = true; gate.receiveShadow = true;
+  gate.position.set(-2.5, 1.1, -12.0);
+  gate.userData = { interactable: 'gate', name: '非常用シェルター扉' };
+  scene.add(gate);
+  interactables.push(gate);
+  function canActivateGate(){ return countRequiredCollected() >= 3; }
+  // Progress HUD: 起動モジュール進捗
+  const progressHUD = document.createElement('div');
+  Object.assign(progressHUD.style, { position:'fixed', right:'12px', top:'12px', background:'rgba(0,0,0,0.55)', color:'#fff', padding:'8px 10px', borderRadius:'8px', fontSize:'13px', zIndex:9998 });
+  progressHUD.id = 'progress-hud';
+  progressHUD.textContent = '起動モジュール: 0/3';
+  document.body.appendChild(progressHUD);
+
+  const REQUIRED_ITEMS = [
+    { kind:'battery_cell', name:'電源セル' },
+    { kind:'access_key',  name:'アクセスキー' },
+    { kind:'boot_chip',   name:'起動チップ' },
+  ];
+  function countRequiredCollected(){
+    let cnt = 0;
+    for(const req of REQUIRED_ITEMS){
+      // スロット配列対応（inventory は固定スロット配列）
+      for(let i=0;i<inventory.length;i++){
+        const it = inventory[i];
+        if(it && it.kind===req.kind && it.qty>0){ cnt++; break; }
+      }
+    }
+    return cnt;
+  }
+  function updateProgressHUD(){
+    const c = countRequiredCollected();
+    const hud = document.getElementById('progress-hud');
+    if(hud) hud.textContent = `起動モジュール: ${c}/3`;
+  }
+  // Inventory overlay（グリッド枠 + スタック最大64）
+  let inventoryVisible = false;
+  const INVENTORY_SLOTS = 12; // 3x4 グリッド
+  const STACK_MAX = 64;
+  const inventory = new Array(INVENTORY_SLOTS).fill(null);
   const invOverlay = document.createElement('div'); invOverlay.id = 'inventory-overlay';
   Object.assign(invOverlay.style, { position:'fixed', inset:'0', display:'none', alignItems:'center', justifyContent:'center', background:'rgba(0,0,0,0.55)', zIndex:9999 });
   const invPanel = document.createElement('div');
   Object.assign(invPanel.style, { background:'rgba(20,22,26,0.95)', color:'#fff', padding:'12px 14px', borderRadius:'8px', minWidth:'300px', maxWidth:'80vw', maxHeight:'70vh', overflow:'auto', boxShadow:'0 8px 24px rgba(0,0,0,0.6)' });
-  invPanel.innerHTML = '<div style="font-weight:700;margin-bottom:8px">インベントリ (Iで閉じる)</div><div id="inv-list"></div>';
+  invPanel.innerHTML = '<div style="font-weight:700;margin-bottom:8px">インベントリ (Iで閉じる)</div><div id="inv-list" style="display:grid;grid-template-columns:repeat(4,64px);gap:10px;justify-content:center"></div>';
   invOverlay.appendChild(invPanel); document.body.appendChild(invOverlay);
   function toggleInventory(force){
     if(typeof force==='boolean') inventoryVisible = force; else inventoryVisible = !inventoryVisible;
     invOverlay.style.display = inventoryVisible ? 'flex' : 'none';
     if(inventoryVisible) renderInventory();
+  if(inventoryVisible) pauseGame(); else resumeGame();
   }
   function renderInventory(){
     const list = invPanel.querySelector('#inv-list'); if(!list) return;
-    if(!inventory.length){ list.innerHTML = '<div style="opacity:0.8">空です</div>'; return; }
-  list.innerHTML = inventory.map((it)=>`<div style=\"display:flex;align-items:center;gap:8px;padding:6px 4px;border-bottom:1px solid rgba(255,255,255,0.08)\"><div style=\"width:18px;height:18px;background:${it.color};border-radius:3px\"></div><div style=\"flex:1\">${it.name}</div><div style=\"opacity:0.7;font-size:12px\">x${it.qty}</div></div>`).join('');
+    list.innerHTML = '';
+    for(let i=0;i<INVENTORY_SLOTS;i++){
+      const it = inventory[i];
+      const slot = document.createElement('div');
+      Object.assign(slot.style, { width:'64px', height:'64px', border:'1px solid rgba(255,255,255,0.25)', borderRadius:'6px', position:'relative', background:'rgba(255,255,255,0.06)' });
+      if(it){
+        const icon = document.createElement('div');
+        Object.assign(icon.style, { position:'absolute', left:'8px', top:'8px', width:'48px', height:'48px', borderRadius:'6px', background: it.color });
+        const qty = document.createElement('div'); qty.textContent = it.qty;
+        Object.assign(qty.style, { position:'absolute', right:'6px', bottom:'4px', padding:'2px 4px', fontSize:'12px', background:'rgba(0,0,0,0.6)', borderRadius:'4px', color:'#fff' });
+        slot.appendChild(icon); slot.appendChild(qty);
+        slot.title = it.name + ` x${it.qty}`;
+      }
+      list.appendChild(slot);
+    }
   }
   function addToInventory(item){
-    const found = inventory.find(i=>i.kind===item.kind && i.name===item.name);
-    if(found) found.qty += 1; else inventory.push({ ...item, qty:1 });
-    renderInventory();
+    // 既存スタック加算（最大 STACK_MAX）
+    for(let i=0;i<INVENTORY_SLOTS;i++){
+      const it = inventory[i];
+      if(it && it.kind===item.kind && it.name===item.name && it.qty < STACK_MAX){
+        it.qty = Math.min(STACK_MAX, it.qty + 1);
+        renderInventory();
+        return true;
+      }
+    }
+    // 空スロットに新規配置
+    for(let i=0;i<INVENTORY_SLOTS;i++){
+      if(!inventory[i]){
+        inventory[i] = { ...item, qty:1 };
+        renderInventory();
+        return true;
+      }
+    }
+    // 満杯（必要なら通知）
+    return false;
   }
   // Simple pickup spawner
   // uses global pickupGroup defined earlier
@@ -2239,6 +2349,16 @@
     for(let i=0;i<nScrap;i++) place(makePickup('scrap','スクラップ',[0x66e0ff,0xff71c5,0x3dff7a,0xffef55][(Math.random()*4)|0]));
     for(let i=0;i<nSmall;i++) place(makePickup('battery_small','小バッテリー',0xaad16a));
     for(let i=0;i<nBig;i++) place(makePickup('battery_big','大バッテリー',0xffc84d));
+  }
+  // 必須アイテムの仮スポーン（座標は暫定）
+  function spawnStoryItems(){
+    function placeAt(x,z, m){ m.position.set(x, 0.12, z); pickupGroup.add(m); interactables.push(m); }
+    // 変電所付近
+    placeAt(10.0, -6.5, makePickup('battery_cell','電源セル',0x55ccff));
+    // 管制室
+    placeAt(-8.0, 5.8, makePickup('access_key','アクセスキー',0x9b6cff));
+    // 研究棟
+    placeAt(3.5, 9.0, makePickup('boot_chip','起動チップ',0x52e07a));
   }
 
   // full map overlay (toggle with 'm')
@@ -2281,10 +2401,12 @@
   function toggleSettings(force){
     if(typeof force==='boolean') settingsVisible = force; else settingsVisible = !settingsVisible;
     settingsOverlay.style.display = settingsVisible ? 'flex' : 'none';
+  if(settingsVisible) pauseGame(); else resumeGame();
   }
   function toggleMap(force){
     if(typeof force==='boolean') mapVisible = force; else mapVisible = !mapVisible;
     mapOverlay.style.display = mapVisible ? 'flex' : 'none';
+  if(mapVisible) pauseGame(); else resumeGame();
   }
   // draw distance (chunks)
   let drawChunkRadius = parseInt(localStorage.getItem('drawChunks')||'8',10);
@@ -2499,6 +2621,11 @@
     requestAnimationFrame(animate);
     const dt = Math.min(0.05, clock.getDelta());
     timeElapsed += dt;
+    // ポーズ中は更新を停止してレンダリングのみ
+    if(isPaused){
+      renderer.render(scene, camera);
+      return;
+    }
     // 死亡中は入力による移動を止め、死亡地点を俯瞰する三人称カメラに切り替える
     if(isDead){
       // 死亡地点（プレイヤー足元＋少し上）を注視点として記録
@@ -2520,6 +2647,8 @@
 
   // 物理ワールドを進める（最小構成：プレイヤー球体＋地面）
   world.step(1/60, dt, 3);
+  // ジャンプクールダウン減衰
+  if(jumpCooldown > 0) jumpCooldown = Math.max(0, jumpCooldown - dt);
 
   const forward = new Vector3(); camera.getWorldDirection(forward); forward.y=0; forward.normalize();
     const right = new Vector3().crossVectors(forward, new Vector3(0,1,0)).normalize();
@@ -2624,6 +2753,47 @@
       return Math.abs(cx - camCX) <= drawChunkRadius && Math.abs(cz - camCZ) <= drawChunkRadius;
     }
 
+    // Debug: draw colliders near camera when enabled
+    if(showColliders){
+      // clear previous
+      while(debugGroup.children.length){ debugGroup.remove(debugGroup.children[0]); }
+      const { circles, segments, boxes } = collectNearby(camera.position.x, camera.position.z, 4);
+      // materials
+      const matCircle = new THREE.LineBasicMaterial({ color: 0x66e0ff });
+      const matSeg = new THREE.LineBasicMaterial({ color: 0xff71c5 });
+      const matBox = new THREE.LineBasicMaterial({ color: 0xffef55 });
+      // circles
+      for(const c of circles){
+        const ring = new THREE.RingGeometry(c.r-0.01, c.r+0.01, 24);
+        const edges = new THREE.LineSegments(new THREE.EdgesGeometry(ring), matCircle);
+        edges.position.set(c.x, 0.02, c.z);
+        debugGroup.add(edges);
+      }
+      // segments (capsules：中心線表示)
+      for(const s of segments){
+        const geo = new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(s.ax, 0.02, s.az),
+          new THREE.Vector3(s.bx, 0.02, s.bz),
+        ]);
+        const line = new THREE.Line(geo, matSeg);
+        debugGroup.add(line);
+      }
+      // boxes（外枠）
+      for(const b of boxes){
+        const hx = b.half.x, hz = b.half.z;
+        const pts = [
+          new THREE.Vector3(-hx,0.02,-hz), new THREE.Vector3(hx,0.02,-hz),
+          new THREE.Vector3(hx,0.02,hz), new THREE.Vector3(-hx,0.02,hz),
+          new THREE.Vector3(-hx,0.02,-hz)
+        ];
+        const geo = new THREE.BufferGeometry().setFromPoints(pts);
+        const line = new THREE.Line(geo, matBox);
+        line.position.set(b.cx, 0, b.cz);
+        line.rotation.y = Math.atan2(b.sin, b.cos);
+        debugGroup.add(line);
+      }
+    }
+
     // --- animate fog sheets (slow drift + keep near camera)
     if(Array.isArray(fogSheets)){
       for(const f of fogSheets){
@@ -2676,6 +2846,8 @@
         label = `【E】拾う: ${target.userData.name}`;
         if(target.userData.kind==='battery_small') label += '（+1）';
         if(target.userData.kind==='battery_big') label += '（+3）';
+      } else if(target.userData.interactable==='gate'){
+        label = canActivateGate()? '【E】シェルター起動' : '起動モジュールが不足しています (3個必要)';
       } else {
         label = '【E】アクション';
       }
@@ -2683,6 +2855,8 @@
     }
     // Arms bobbing and reach animation
     const moveAmount = hVel.length();
+  // grounded は player.grounded を使用（未定義参照の修正）
+  const grounded = player.grounded === true;
     armBob += dt * (grounded ? (4.0 + 2.0*Math.min(1, moveAmount)) : 0);
   const bob = grounded ? Math.sin(armBob) * 0.05 * Math.min(1, moveAmount*0.4) : 0;
     rightShoulder.rotation.z = 0.15 + bob*0.6;
@@ -3038,6 +3212,7 @@
     if(ud.interactable === 'pickup'){
       armReachT = 1.0;
       addToInventory({ kind: ud.kind, name: ud.name, color: ud.color });
+  updateProgressHUD();
       const idx = interactables.indexOf(highlighted); if(idx>=0) interactables.splice(idx,1);
       if(highlighted.parent) highlighted.parent.remove(highlighted);
       highlighted = null; prompt.style.display = 'none';
@@ -3047,6 +3222,19 @@
         osc.type='sine'; osc.frequency.value = 880; g.gain.value = 0.0001; osc.connect(g); g.connect(audioCtx.destination);
         const t = audioCtx.currentTime; g.gain.linearRampToValueAtTime(0.06, t+0.02); g.gain.exponentialRampToValueAtTime(0.0001, t+0.25); osc.start(); osc.stop(t+0.28);
       }
+    } else if(ud.interactable === 'gate'){
+      if(canActivateGate()){
+        // 起動演出
+        if(highlighted.material){ highlighted.material.emissive = new THREE.Color(0x33ff99); highlighted.material.emissiveIntensity = 0.5; }
+        // 簡易SE
+        if(audioStarted){ const o=audioCtx.createOscillator(); const g=audioCtx.createGain(); o.type='sawtooth'; o.frequency.value=320; g.gain.value=0.0001; o.connect(g); g.connect(audioCtx.destination); const t=audioCtx.currentTime; g.gain.linearRampToValueAtTime(0.08,t+0.05); g.gain.exponentialRampToValueAtTime(0.0001,t+0.7); o.start(); o.stop(t+0.75);}      
+        // 脱出完了の簡易画面
+        const done = document.createElement('div');
+        Object.assign(done.style, { position:'fixed', inset:'0', display:'flex', alignItems:'center', justifyContent:'center', background:'rgba(0,0,0,0.8)', color:'#fff', zIndex:99999 });
+        done.innerHTML = '<div style="text-align:center"><div style="font-size:24px;font-weight:800;margin-bottom:12px">脱出成功</div><div style="opacity:0.85;margin-bottom:16px">非常用シェルターが起動しました</div><button id="btn-restart" style="padding:8px 12px;border-radius:6px;border:0;background:#3b7cff;color:#fff;font-weight:600;cursor:pointer">最初からやり直す</button></div>';
+        document.body.appendChild(done);
+        const br = done.querySelector('#btn-restart'); if(br){ br.addEventListener('click', ()=>{ location.reload(); }); }
+      }
     } else {
       armReachT = 1.0;
     }
@@ -3055,17 +3243,22 @@
   function tryUseBattery(){
     // prefer big battery
     const use = (kind)=>{
-      const it = inventory.find(i=>i.kind===kind && i.qty>0);
-      if(!it) return false;
+      // スロット配列から対象スロットを検索
+      let idx = -1; let it = null;
+      for(let i=0;i<INVENTORY_SLOTS;i++){
+        const cand = inventory[i];
+        if(cand && cand.kind===kind && cand.qty>0){ idx = i; it = cand; break; }
+      }
+      if(idx<0 || !it) return false;
       if(kind==='battery_big'){ var add=3; } else if(kind==='battery_small'){ var add=1; } else { return false; }
       const need = batteryMaxSegments - batterySegments; if(need<=0) return false;
       const gain = Math.min(add, need);
-      batterySegments += gain; it.qty -= 1; if(it.qty<=0){ const idx = inventory.indexOf(it); if(idx>=0) inventory.splice(idx,1); }
+  batterySegments += gain; it.qty -= 1; if(it.qty<=0){ inventory[idx] = null; }
       updateBatteryUI(); renderInventory();
       // feedback sound
       if(audioStarted){ const o=audioCtx.createOscillator(); const g=audioCtx.createGain(); o.type='triangle'; o.frequency.value=520; g.gain.value=0.0001; o.connect(g); g.connect(audioCtx.destination); const t=audioCtx.currentTime; g.gain.linearRampToValueAtTime(0.06,t+0.02); g.gain.exponentialRampToValueAtTime(0.0001,t+0.25); o.start(); o.stop(t+0.28);}      
       return true;
-    };
+  };
     if(use('battery_big')) return; use('battery_small');
   }
 })();
