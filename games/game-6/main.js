@@ -33,6 +33,10 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 container.appendChild(renderer.domElement);
 // hide cursor when over canvas
 renderer.domElement.style.cursor = 'none';
+// ensure canvas sits behind HUD layers
+renderer.domElement.style.position = 'fixed';
+renderer.domElement.style.inset = '0';
+renderer.domElement.style.zIndex = '1';
 // crosshair control (show only when pointer is locked)
 const crosshairEl = document.getElementById('crosshair');
 if (crosshairEl) crosshairEl.style.display = 'none';
@@ -92,6 +96,8 @@ function makePlatform(x, y, z, w = 4, d = 2, color = 0x7b8a8b) {
 let genState = null;
 // shown once when the player reaches the highest platform
 let congratsShown = false;
+// Flag object placed on the highest platform
+let highestFlag = null; // THREE.Group
 // --- Time Attack state ---
 let taRunning = false;      // timer counting now
 let taFinished = false;     // finished by reaching highest platform
@@ -116,7 +122,8 @@ function generatePlatforms() {
 	platforms.forEach(p => scene.remove(p.mesh));
 	platforms.length = 0;
 	// starting ground (wider)
-	makePlatform(0, 0, 0, 60, 60, 0xbcd7ff);
+	// Make ground visually infinite by using a huge platform
+	makePlatform(0, 0, 0, 10000, 10000, 0xbcd7ff);
 	// mark first platform as ground so it doesn't block overlap checks
 	if (platforms[0]) platforms[0].isGround = true;
 	// initialize generator; do not add course platforms yet
@@ -129,6 +136,8 @@ function generatePlatforms() {
 	congratsShown = false;
 	hideCongratsUI();
 	// do not auto-start timer here; timer starts when game starts or on manual restart
+	// place flag on highest platform
+	placeFlagOnHighestPlatform();
 }
 
 function addNextPlatform() {
@@ -152,6 +161,21 @@ function addNextPlatform() {
 		return false;
 	};
 
+	// forbid making platforms too close to any previous (to avoid alternate reachable jumps)
+	const TOO_CLOSE_DIST = 10.0;
+	const isTooCloseToAny = (cx, cz) => {
+		for (let i = 1; i < platforms.length; i++) { // skip ground at 0
+			const p = platforms[i];
+			const dx = cx - p.mesh.position.x;
+			const dz = cz - p.mesh.position.z;
+			const dist = Math.hypot(dx, dz);
+			// allow proximity only to the immediate predecessor
+			const isPrev = (i === platforms.length - 1);
+			if (!isPrev && dist < TOO_CLOSE_DIST) return true;
+		}
+		return false;
+	};
+
 	// propose up to N candidates to avoid overlaps
 	let placed = false;
 	const MAX_TRIES = 48;
@@ -164,24 +188,16 @@ function addNextPlatform() {
 		let step = MIN_STEP_DIST + Math.random() * (MAX_STEP_DIST - MIN_STEP_DIST);
 		let dx = Math.cos(dir) * step;
 		let dz = Math.sin(dir) * step;
-		// vertical
-		let rawDy = -0.4 + Math.random() * 1.6;
-		if (Math.random() < 0.15) rawDy = -0.3 + Math.random() * 0.2;
-		let dy = rawDy >= 0 ? rawDy * VERT_UP_SCALE : rawDy * VERT_DOWN_SCALE;
-		if (dy > MAX_DY) dy = MAX_DY;
+	// vertical: enforce strictly upward to create a single climbing route
+	let dy = 0.8 + Math.random() * (MAX_DY - 0.8);
 		if (dy > 1.6) { step *= 0.85; dx = Math.cos(dir) * step; dz = Math.sin(dir) * step; }
 		candX = Math.max(-BOUNDS_X, Math.min(BOUNDS_X, s.x + dx));
 		candZ = Math.max(-BOUNDS_Z, Math.min(BOUNDS_Z, s.z + dz));
 		candY = s.y + dy;
 		// size
-		if ((s.i + 1) % 7 === 0) {
-			candW = 8 + Math.random() * 6;
-			candD = 4 + Math.random() * 4;
-		} else {
-			candW = 2.6 + Math.random() * 4.2;
-			candD = 1.8 + Math.random() * 3.2;
-		}
-		if (!overlapsCandidate(candX, candZ, candW, candD)) {
+	candW = 3.0 + Math.random() * 2.0; // keep small for precision jumps
+	candD = 2.0 + Math.random() * 1.5;
+	if (!overlapsCandidate(candX, candZ, candW, candD) && !isTooCloseToAny(candX, candZ)) {
 			placed = true;
 			s.dir = dir;
 			break;
@@ -214,10 +230,12 @@ function addNextPlatform() {
 	const color = PAL[s.i % PAL.length];
 	makePlatform(candX, candY, candZ, candW, candD, color);
 	s.x = candX; s.y = candY; s.z = candZ; s.i++;
+	// after adding, update flag position to the current highest
+	placeFlagOnHighestPlatform();
 }
 
 // bulk generation helper
-function bulkGenerate(count = 95) { // fewer platforms to avoid crowding now that spacing is larger
+function bulkGenerate(count = 75) { // tuned for single upward route
 	for (let i = 0; i < count; i++) addNextPlatform();
 }
 
@@ -242,19 +260,66 @@ function snapLowestPlatformToFloor() {
 		target = list[0];
 	}
 	if (!target) return;
-	// Place target so that its bottom sits on the floor: bottom = 0 => top = PLATFORM_THICKNESS
-	target.y = PLATFORM_THICKNESS;
+	// Raise the lowest platform slightly above the floor (lowered to +1.0)
+	target.y = PLATFORM_THICKNESS + 1.0;
 	// mesh is positioned by center; we store top as y, so set center = top - thickness/2
 	target.mesh.position.y = target.y - PLATFORM_THICKNESS / 2;
+}
+
+// Create or move a flag onto the highest non-ground platform
+function placeFlagOnHighestPlatform() {
+	// find highest platform excluding ground
+	let highest = null;
+	for (const p of platforms) {
+		if (p.isGround) continue;
+		if (!highest || p.y > highest.y) highest = p;
+	}
+	if (!highest) return;
+	// remove previous flag
+	if (highestFlag) {
+		scene.remove(highestFlag);
+		highestFlag = null;
+	}
+	// build flag group: pole + banner
+	const group = new THREE.Group();
+	const poleHeight = 5;
+	const poleGeo = new THREE.CylinderGeometry(0.08, 0.08, poleHeight, 12);
+	const poleMat = new THREE.MeshStandardMaterial({ color: 0xdddddd, metalness: 0.2, roughness: 0.4 });
+	const pole = new THREE.Mesh(poleGeo, poleMat);
+	pole.castShadow = false; pole.receiveShadow = false;
+	pole.position.set(0, poleHeight/2, 0);
+	group.add(pole);
+	// banner
+	const bannerW = 1.8;
+	const bannerH = 1.2;
+	const bannerGeo = new THREE.PlaneGeometry(bannerW, bannerH);
+	const bannerMat = new THREE.MeshStandardMaterial({ color: 0xff3355, side: THREE.DoubleSide });
+	const banner = new THREE.Mesh(bannerGeo, bannerMat);
+	banner.position.set(bannerW/2 + 0.05, poleHeight - bannerH/2 - 0.2, 0);
+	banner.rotation.y = Math.PI / 2; // face sideways from pole
+	group.add(banner);
+	// place group at platform top corner
+	const pm = highest.mesh.position;
+	const px = pm.x + (highest.w/2 - 0.3);
+	const pz = pm.z + (highest.d/2 - 0.3);
+	const pyTop = highest.y; // top surface y
+	group.position.set(px, pyTop, pz);
+	scene.add(group);
+	highestFlag = group;
 }
 
 // --- Controls ---
 const keys = {};
 let dashHeld = false; // Left Shift for dash
+let flyMode = false;  // Toggle flight mode to move in air
 window.addEventListener('keydown', (e) => {
 	const k = e.key.toLowerCase();
 	keys[k] = true;
 	if (e.code === 'ShiftLeft') dashHeld = true;
+	// Toggle flight mode with P
+	if (k === 'p') {
+		flyMode = !flyMode;
+	}
 	// On movement keys, try to acquire pointer lock so rotation is always relative
 	if (gameStarted && !isPointerLocked) {
 		const moveKeys = ['w','a','s','d','arrowup','arrowdown','arrowleft','arrowright'];
@@ -382,23 +447,57 @@ function hideCongratsUI() {
 }
 
 function ensureTimerUI() {
+	// Parent to fullscreen element if present, otherwise body
+	const parentEl = document.fullscreenElement || document.body;
+	// HUD container
+	let hud = document.getElementById('hud-overlay');
+	if (!hud) {
+		hud = document.createElement('div');
+		hud.id = 'hud-overlay';
+		hud.style.position = 'fixed';
+		hud.style.top = '0';
+		hud.style.left = '0';
+		hud.style.right = '0';
+		hud.style.pointerEvents = 'none';
+		hud.style.zIndex = '9999';
+		hud.style.display = 'flex';
+		hud.style.justifyContent = 'flex-end';
+		hud.style.padding = '12px';
+		parentEl.appendChild(hud);
+	}
+	// If HUD exists but is not under current parent, move it
+	if (hud.parentElement !== parentEl) {
+		parentEl.appendChild(hud);
+	}
+	// Timer pill
 	let wrap = document.getElementById('timer');
 	if (!wrap) {
 		wrap = document.createElement('div');
 		wrap.id = 'timer';
-		wrap.style.position = 'fixed';
-		wrap.style.top = '10px';
-		wrap.style.left = '10px';
-		wrap.style.padding = '6px 10px';
-		wrap.style.background = 'rgba(0,0,0,0.35)';
-		wrap.style.borderRadius = '6px';
+		wrap.style.display = 'inline-flex';
+		wrap.style.gap = '12px';
+		wrap.style.alignItems = 'center';
+		wrap.style.padding = '8px 14px';
+		wrap.style.background = 'rgba(20,22,26,0.55)';
+		wrap.style.backdropFilter = 'blur(3px)';
+		wrap.style.border = '1px solid rgba(255,255,255,0.15)';
+		wrap.style.boxShadow = '0 4px 14px rgba(0,0,0,0.25)';
+		wrap.style.borderRadius = '999px';
 		wrap.style.color = '#fff';
-		wrap.style.fontFamily = 'system-ui, sans-serif';
+		wrap.style.fontFamily = 'system-ui, -apple-system, Segoe UI, Roboto, Noto Sans JP, sans-serif';
 		wrap.style.fontWeight = '700';
-		wrap.style.fontSize = '16px';
+		wrap.style.fontSize = '18px';
+		wrap.style.lineHeight = '1';
 		wrap.style.pointerEvents = 'none';
-		wrap.innerHTML = '<div>Time: <span id="timer-current">0.00</span>s</div><div style="opacity:.9">Best: <span id="timer-best">--</span>s</div>';
-		document.body.appendChild(wrap);
+		// content
+		const cur = document.createElement('div');
+		cur.innerHTML = '⏱ <span id="timer-current">0.00</span>s';
+		const best = document.createElement('div');
+		best.style.opacity = '0.85';
+		best.innerHTML = '🏁 <span id="timer-best">--</span>s';
+		wrap.appendChild(cur);
+		wrap.appendChild(best);
+	hud.appendChild(wrap);
 	}
 	// update best display once
 	const bestEl = document.getElementById('timer-best');
@@ -508,18 +607,30 @@ function checkCollisions() {
 	} else {
 		// sticky ground: if we were grounded and still very near the same top, keep contact
 		if (player.ground && player.vel.y <= 2) {
-			const gp = player.ground.plat.mesh.position;
 			const gy = player.ground.yTop;
-			const halfPlatX = player.ground.plat.w / 2;
-			const halfPlatZ = player.ground.plat.d / 2;
-			const withinX = Math.abs(player.pos.x - gp.x) <= (pHalfX + halfPlatX + 0.05);
-			const withinZ = Math.abs(player.pos.z - gp.z) <= (pHalfZ + halfPlatZ + 0.05);
-			const bottom = player.pos.y - PLAYER_SIZE.y / 2;
-			if (withinX && withinZ && bottom <= gy + 0.08 && bottom >= gy - 0.25) {
-				player.pos.y = gy + PLAYER_SIZE.y / 2;
-				player.vel.y = 0;
-				player.onGround = true;
-				return;
+			if (player.ground.plat) {
+				// Sticky contact with an actual platform
+				const gp = player.ground.plat.mesh.position;
+				const halfPlatX = player.ground.plat.w / 2;
+				const halfPlatZ = player.ground.plat.d / 2;
+				const withinX = Math.abs(player.pos.x - gp.x) <= (pHalfX + halfPlatX + 0.05);
+				const withinZ = Math.abs(player.pos.z - gp.z) <= (pHalfZ + halfPlatZ + 0.05);
+				const bottom = player.pos.y - PLAYER_SIZE.y / 2;
+				if (withinX && withinZ && bottom <= gy + 0.08 && bottom >= gy - 0.25) {
+					player.pos.y = gy + PLAYER_SIZE.y / 2;
+					player.vel.y = 0;
+					player.onGround = true;
+					return;
+				}
+			} else {
+				// Sticky contact with virtual infinite ground at y=gy
+				const bottom = player.pos.y - PLAYER_SIZE.y / 2;
+				if (bottom <= gy + 0.08 && bottom >= gy - 0.25) {
+					player.pos.y = gy + PLAYER_SIZE.y / 2;
+					player.vel.y = 0;
+					player.onGround = true;
+					return;
+				}
 			}
 		}
 		player.onGround = false;
@@ -534,6 +645,45 @@ function checkCollisions() {
 			player.vel.y = 0;
 			player.onGround = true;
 			player.ground = { plat: null, yTop: groundY };
+		}
+	}
+
+	// --- Side collisions (AABB resolution along X/Z) ---
+	// Resolve horizontal overlaps against platform sides when within platform vertical span.
+	// This prevents the player from clipping through platform edges.
+	for (let plat of platforms) {
+		// Skip infinite ground side collisions
+		if (plat.isGround) continue;
+		const p = plat.mesh.position;
+		const halfPlatX = plat.w / 2;
+		const halfPlatZ = plat.d / 2;
+		const platTop = plat.y;
+		const platBottom = plat.y - PLATFORM_THICKNESS;
+		// Player vertical range
+		const playerTop = player.pos.y + PLAYER_SIZE.y / 2;
+		const playerBottomY = player.pos.y - PLAYER_SIZE.y / 2;
+		// Require some vertical overlap with the platform body
+		const overlapY = !(playerTop <= platBottom + 1e-3 || playerBottomY >= platTop - 1e-3);
+		if (!overlapY) continue;
+		// Compute horizontal overlaps
+		const dx = (p.x - player.pos.x);
+		const dz = (p.z - player.pos.z);
+		const overlapX = (pHalfX + halfPlatX) - Math.abs(dx);
+		const overlapZ = (pHalfZ + halfPlatZ) - Math.abs(dz);
+		if (overlapX > 0 && overlapZ > 0) {
+			// Resolve along the smallest penetration axis
+			if (overlapX < overlapZ) {
+				// push along X
+				const signX = dx > 0 ? 1 : -1; // platform center relative to player
+				player.pos.x = p.x - signX * (halfPlatX + pHalfX);
+				// damp horizontal velocity on that axis
+				player.vel.x = 0;
+			} else {
+				// push along Z
+				const signZ = dz > 0 ? 1 : -1;
+				player.pos.z = p.z - signZ * (halfPlatZ + pHalfZ);
+				player.vel.z = 0;
+			}
 		}
 	}
 }
@@ -573,10 +723,7 @@ function animate(t) {
 	// physics sub-stepping for robust collisions
 	physicsStep(dt);
 
-	// simple floor: if fall too low, reset to start
-	if (player.pos.y < -20) {
-		respawn();
-	}
+	// No forced teleport: allow infinite travel
 	// update meshes
 	player.mesh.position.copy(player.pos);
 
@@ -591,6 +738,12 @@ function animate(t) {
 	const e = new THREE.Euler(pitch, yaw, 0, 'YXZ');
 	camera.quaternion.setFromEuler(e);
 
+	// Keep the visual ground centered under the camera so its edges are never visible
+	if (platforms[0] && platforms[0].isGround) {
+		platforms[0].mesh.position.x = camera.position.x;
+		platforms[0].mesh.position.z = camera.position.z;
+	}
+
 	// update UI height (max height achieved)
 	if (player.pos.y > maxHeight) maxHeight = player.pos.y;
 	const heightEl = document.getElementById('height');
@@ -604,7 +757,7 @@ requestAnimationFrame(animate);
 
 // --- Helpers ---
 function physicsStep(dt) {
-	const GRAV = -30;
+	const GRAV = flyMode ? 0 : -30;
 	const MAX_FALL = -40;
 	// dynamic substeps based on vertical speed and dt
 	const estTravel = Math.abs(player.vel.y) * dt;
@@ -669,6 +822,23 @@ fsBtns.forEach(btn => {
 	});
 });
 
+// Ensure UI visibility when fullscreen state changes
+document.addEventListener('fullscreenchange', () => {
+	// Recreate/ensure timer element and bring to front
+	ensureTimerUI();
+	const wrap = document.getElementById('timer');
+	if (wrap) {
+		wrap.style.display = 'block';
+		wrap.style.position = 'fixed';
+		wrap.style.zIndex = '9999';
+	}
+	const hud = document.getElementById('hud-overlay');
+	const parentEl = document.fullscreenElement || document.body;
+	if (hud && hud.parentElement !== parentEl) {
+		parentEl.appendChild(hud);
+	}
+});
+
 // expose for debugging
 window.__TKK_game = { player, platforms, scene };
 
@@ -697,6 +867,13 @@ if (startBtn && overlay) {
 	startBtn.addEventListener('click', () => {
 		gameStarted = true;
 		overlay.style.display = 'none';
+		// Request fullscreen immediately on user gesture
+		const target = container || document.body;
+		try {
+			if (!document.fullscreenElement) {
+				(target.requestFullscreen || target.webkitRequestFullscreen)?.call(target);
+			}
+		} catch (_) {}
 		// Request pointer lock immediately for smoother start
 		try { renderer.domElement.requestPointerLock(); } catch (_) {}
 		renderer.domElement.focus?.();
