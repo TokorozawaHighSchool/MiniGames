@@ -62,7 +62,9 @@
   // 物理エンジン cannon-es をCDNから読み込み（最小構成：地面とプレイヤー球体）
   const CANNON = await import('https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js');
   const { Scene, PerspectiveCamera, WebGLRenderer, Color, FogExp2, DirectionalLight, AmbientLight, HemisphereLight, PlaneGeometry, MeshStandardMaterial, Mesh, Vector3, CanvasTexture, CylinderGeometry, InstancedMesh, PointLight, BoxGeometry, BufferGeometry, Points, PointsMaterial, Group, ConeGeometry, MeshBasicMaterial, DoubleSide, ShaderMaterial } = THREE;
-  // GLTFLoader をCDNから読み込み
+  // 外部マップ（GLTF）を優先するフラグ
+  const useExternalMap = true;
+  // GLTFLoader をESM CDNから読み込み（bare specifier 'three' を解決するため esm.sh を使用）
   const { GLTFLoader } = await import('https://cdn.jsdelivr.net/npm/three@0.152.2/examples/jsm/loaders/GLTFLoader.js');
 
   // --- 物理ワールド（cannon-es）最小セットアップ ---
@@ -353,34 +355,57 @@
   const asphaltMap = makeAsphaltTexture(); asphaltMap.repeat.set(50,50); // 縮尺に合わせてタイル数調整
   const roughMap = makeRoughnessTexture(); roughMap.repeat.set(50,50);
   const groundMat = new MeshStandardMaterial({ color:0x2a2e33, map: asphaltMap, roughnessMap: roughMap, roughness: 1.0, metalness: 0.0 });
-  const ground = new Mesh(planeGeo, groundMat);
-  ground.receiveShadow = true; scene.add(ground);
+  if(!useExternalMap){
+    const ground = new Mesh(planeGeo, groundMat);
+    ground.receiveShadow = true; scene.add(ground);
+  }
 
   // --- 外部GLTF/GLB 読み込みヘルパー ---
+  let externalMapRoot = null;
+  let externalCollidableMeshes = [];
+  // レイキャスト共有インスタンス & 簡易キャッシュ
+  const sharedRaycaster = new THREE.Raycaster();
+  let lastGYQuery = { x: Infinity, z: Infinity, y: 0, time: 0 };
   async function loadExternalGLTF(url, { position = new THREE.Vector3(0,0,0), scale = 1.0, rotationY = 0 } = {}){
     const loader = new GLTFLoader();
     return new Promise((resolve, reject)=>{
       loader.load(url, (gltf)=>{
         const root = gltf.scene || gltf.scenes?.[0];
         if(!root){ reject(new Error('GLTF has no scene')); return; }
-        root.traverse((obj)=>{ if(obj.isMesh){ obj.castShadow = true; obj.receiveShadow = true; }});
+        const collidable = [];
+        root.traverse((obj)=>{ if(obj.isMesh){ obj.castShadow = true; obj.receiveShadow = true; collidable.push(obj); }});
         root.position.copy(position);
         root.scale.setScalar(scale);
         root.rotation.y = rotationY;
         scene.add(root);
+        externalMapRoot = root;
+        externalCollidableMeshes = collidable;
         resolve(root);
       }, undefined, (err)=>{ reject(err); });
     });
   }
 
+  // ローカルマップを読み込み（games/game-5/map_3d/scene.gltf）
+  try{
+    await loadExternalGLTF('./map_3d/scene.gltf', {
+      position: new THREE.Vector3(0, 0, 0),
+      scale: 1.0,
+      rotationY: 0
+    });
+  }catch(err){
+    console.warn('GLTF map load failed:', err);
+  }
+
   // roads: two crossing planes forming an intersection
-  const roadTex = makeRoadTexture({w:1024,h:512,lanes:2,dashed:true});
-  roadTex.repeat.set(72,1); // scaled for long road
-  const roadMat = new MeshStandardMaterial({ map: roadTex, roughness: 0.95, metalness: 0.0 });
-  const roadA = new Mesh(new PlaneGeometry(980, 14, 1, 1), roadMat);
-  roadA.rotation.x = -Math.PI/2; roadA.position.y = 0.01; scene.add(roadA);
-  const roadB = new Mesh(new PlaneGeometry(14, 980, 1, 1), roadMat);
-  roadB.rotation.x = -Math.PI/2; roadB.position.y = 0.011; scene.add(roadB);
+  if(!useExternalMap){
+    const roadTex = makeRoadTexture({w:1024,h:512,lanes:2,dashed:true});
+    roadTex.repeat.set(72,1);
+    const roadMat = new MeshStandardMaterial({ map: roadTex, roughness: 0.95, metalness: 0.0 });
+    const roadA = new Mesh(new PlaneGeometry(980, 14, 1, 1), roadMat);
+    roadA.rotation.x = -Math.PI/2; roadA.position.y = 0.01; scene.add(roadA);
+    const roadB = new Mesh(new PlaneGeometry(14, 980, 1, 1), roadMat);
+    roadB.rotation.x = -Math.PI/2; roadB.position.y = 0.011; scene.add(roadB);
+  }
 
   // decals: cracks and oil stains
   function makeCrackTexture(w=512,h=256, branches=18){
@@ -658,13 +683,30 @@
     return info;
   }
 
-  // 指定位置の地面Yを返す（屋上対応）
+  // 指定位置の地面Yを返す（外部GLTFがある場合は見た目に合わせてレイキャスト）
   function getGroundYAt(x, z){
+    if(useExternalMap && externalMapRoot){
+      // 近距離キャッシュ（1.5m以内・10ms以内なら再利用）
+      const now = performance.now ? performance.now() : Date.now();
+      const dx = x - lastGYQuery.x, dz = z - lastGYQuery.z;
+      if(Math.hypot(dx, dz) < 1.5 && (now - lastGYQuery.time) < 10){
+        return lastGYQuery.y;
+      }
+      sharedRaycaster.ray.origin.set(x, 1000, z);
+      sharedRaycaster.ray.direction.set(0, -1, 0);
+      sharedRaycaster.near = 0; sharedRaycaster.far = 2000;
+      const hits = sharedRaycaster.intersectObject(externalMapRoot, true);
+      if(hits && hits.length){
+        lastGYQuery = { x, z, y: hits[0].point.y, time: now };
+        return hits[0].point.y;
+      }
+      lastGYQuery = { x, z, y: 0, time: now };
+      return 0; // ヒットしない場合は地面0
+    }
     let gy = 0;
     if(landmarkInfo){
       const dx = x - landmarkInfo.x, dz = z - landmarkInfo.z;
       const r = Math.hypot(dx, dz);
-      // 屋上の有効半径（記録された値を優先）
       const rr = (landmarkInfo.roofRadius || 12);
       if(r < rr){ gy = Math.max(gy, landmarkInfo.height); }
     }
@@ -780,10 +822,12 @@
   }
 
   // まず中心ランドマークを生成（他タワーは距離制約で回避）
-  landmarkInfo = createLandmarkMegaTower(0, 0);
-  // 屋上へ初期スポーン（目線高を加味してその場で立てるように）
-  if(landmarkInfo){
-    camera.position.set(landmarkInfo.x, landmarkInfo.height + 1.6, landmarkInfo.z + 2);
+  if(!useExternalMap){
+    landmarkInfo = createLandmarkMegaTower(0, 0);
+    // 屋上へ初期スポーン（目線高を加味してその場で立てるように）
+    if(landmarkInfo){
+      camera.position.set(landmarkInfo.x, landmarkInfo.height + 1.6, landmarkInfo.z + 2);
+    }
   }
   // 屋上の床とエレベーター乗り場を構築
   // 屋上の床とエレベーター乗り場（関数定義のみ：実行はコリジョン準備後）
@@ -838,13 +882,15 @@
   const halfZ = hutD*0.5 * 0.9;
   addBoxCollider(hx, hz, halfX, halfZ, 0);
   };
-  spawnTowerCluster(0, 0, 190, 46, 1.25);
-  spawnTowerCluster(210, 90, 150, 26, 1.05);
-  spawnTowerCluster(-220, 110, 150, 26, 1.1);
-  spawnTowerCluster(170, -210, 140, 24, 0.95);
-  spawnTowerCluster(-230, -170, 150, 24, 0.95);
-  spawnTowerCluster(0, 240, 130, 18, 0.85);
-  spawnTowerCluster(0, -240, 130, 18, 0.85);
+  if(!useExternalMap){
+    spawnTowerCluster(0, 0, 190, 46, 1.25);
+    spawnTowerCluster(210, 90, 150, 26, 1.05);
+    spawnTowerCluster(-220, 110, 150, 26, 1.1);
+    spawnTowerCluster(170, -210, 140, 24, 0.95);
+    spawnTowerCluster(-230, -170, 150, 24, 0.95);
+    spawnTowerCluster(0, 240, 130, 18, 0.85);
+    spawnTowerCluster(0, -240, 130, 18, 0.85);
+  }
 
   function chooseBridgeAnchor(a, b){
     let best = null; let bestDiff = Infinity;
@@ -903,95 +949,99 @@
   }
 
   // --- neon signs with intermittent flicker and sparks
-  const neonGroup = new Group(); scene.add(neonGroup);
-  const neonMeshes = []; const neonCtrl = [];
-  function addNeon(x, z, w=3.2, h=1.0, color=0x66e0ff){
-    const geo = new PlaneGeometry(w, h);
-    // dark backing + high emissive for punchy neon; slight metallic to catch specular rain
-    const mat = new MeshStandardMaterial({ color: 0x060606, emissive: color, emissiveIntensity: 0.4, roughness: 0.82, metalness: 0.15 });
-    const m = new Mesh(geo, mat); m.rotation.x = -Math.PI/2; m.rotation.z = Math.random()*Math.PI; // lay as if panel oriented randomly near ground
-    // raise slightly to be visible above ground; tilt a bit
-    m.position.set(x, 0.03, z); m.rotation.x = -Math.PI/2 + (Math.random()*2-1)*0.15;
-    neonGroup.add(m);
-    neonMeshes.push(m);
-  // per-panel flicker profile and an optional point light to bleed color into scene
-  const light = new PointLight(color, 0.0, 12, 2.0); light.position.set(x, 1.0, z); scene.add(light);
-  neonCtrl.push({ base: 2.2 + Math.random()*3.0, speed: 2.0 + Math.random()*3.0, jitter: Math.random()*Math.PI*2, offProb: 0.04 + Math.random()*0.05, nextSpark: 0, light });
+let neonGroup; if(!useExternalMap){ neonGroup = new Group(); scene.add(neonGroup); }
+const neonMeshes = []; const neonCtrl = [];
+function addNeon(x, z, w=3.2, h=1.0, color=0x66e0ff){
+  const geo = new PlaneGeometry(w, h);
+  const mat = new MeshStandardMaterial({ color: 0x060606, emissive: color, emissiveIntensity: 0.4, roughness: 0.82, metalness: 0.15 });
+  const m = new Mesh(geo, mat); m.rotation.x = -Math.PI/2; m.rotation.z = Math.random()*Math.PI;
+  m.position.set(x, 0.03, z); m.rotation.x = -Math.PI/2 + (Math.random()*2-1)*0.15;
+  if(!useExternalMap){ neonGroup.add(m); }
+  neonMeshes.push(m);
+  if(!useExternalMap){
+    const light = new PointLight(color, 0.0, 12, 2.0); light.position.set(x, 1.0, z); scene.add(light);
+    neonCtrl.push({ base: 2.2 + Math.random()*3.0, speed: 2.0 + Math.random()*3.0, jitter: Math.random()*Math.PI*2, offProb: 0.04 + Math.random()*0.05, nextSpark: 0, light });
+  } else {
+    neonCtrl.push({ base: 0, speed: 0, jitter: 0, offProb: 1, nextSpark: 0, light: null });
   }
-  // distribute some neons near roads
+}
+// distribute some neons near roads
+if(!useExternalMap){
   const neonColors = neonPalette;
   for(let i=0;i<12;i++){
-    // along x-road and z-road edges
     const onX = Math.random()<0.5;
     const col = neonColors[Math.floor(Math.random()*neonColors.length)];
-  if(onX){ addNeon((Math.random()*2-1)*480, (Math.random()<0.5? 9.0 : -9.0) + (Math.random()*2-1)*3, 3+Math.random()*2, 0.8+Math.random()*0.6, col); }
-  else { addNeon((Math.random()<0.5? 9.0 : -9.0) + (Math.random()*2-1)*3, (Math.random()*2-1)*480, 3+Math.random()*2, 0.8+Math.random()*0.6, col); }
+    if(onX){ addNeon((Math.random()*2-1)*480, (Math.random()<0.5? 9.0 : -9.0) + (Math.random()*2-1)*3, 3+Math.random()*2, 0.8+Math.random()*0.6, col); }
+    else { addNeon((Math.random()<0.5? 9.0 : -9.0) + (Math.random()*2-1)*3, (Math.random()*2-1)*480, 3+Math.random()*2, 0.8+Math.random()*0.6, col); }
   }
+}
 
-  // spark particle system (multiple ephemeral bursts)
-  const sparkBursts = [];
-  function spawnSparkParticles(pos){
-    const count = 20;
-    const g = new BufferGeometry();
-    const positions = new Float32Array(count*3);
-    const velocities = new Float32Array(count*3);
-    for(let i=0;i<count;i++){
-      const ix = i*3;
-      positions[ix+0] = pos.x; positions[ix+1] = pos.y + 0.1; positions[ix+2] = pos.z;
-      const a = Math.random()*Math.PI*2; const up = Math.random()*0.9 + 0.2;
-      const sp = 3.0 + Math.random()*4.0;
-      velocities[ix+0] = Math.cos(a)*sp*0.5; velocities[ix+1] = up*sp; velocities[ix+2] = Math.sin(a)*sp*0.5;
+// spark particle system
+const sparkBursts = [];
+function spawnSparkParticles(pos){
+  if(useExternalMap) return;
+  const count = 20;
+  const g = new BufferGeometry();
+  const positions = new Float32Array(count*3);
+  const velocities = new Float32Array(count*3);
+  for(let i=0;i<count;i++){
+    const ix = i*3;
+    positions[ix+0] = pos.x; positions[ix+1] = pos.y + 0.1; positions[ix+2] = pos.z;
+    const a = Math.random()*Math.PI*2; const up = Math.random()*0.9 + 0.2;
+    const sp = 3.0 + Math.random()*4.0;
+    velocities[ix+0] = Math.cos(a)*sp*0.5; velocities[ix+1] = up*sp; velocities[ix+2] = Math.sin(a)*sp*0.5;
+  }
+  g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  g.setAttribute('velocity', new THREE.Float32BufferAttribute(velocities, 3));
+  const m = new PointsMaterial({ color: 0xfff2a8, size: 0.08, transparent: true, opacity: 1.0, depthWrite:false });
+  const p = new Points(g, m); p.userData.life = 0.25 + Math.random()*0.25; p.userData.age = 0;
+  scene.add(p); sparkBursts.push(p);
+}
+
+// --- wrecked cars (low-poly)
+let carGroup; if(!useExternalMap){ carGroup = new Group(); scene.add(carGroup); }
+// shared geometries/materials
+const gCarBody = new BoxGeometry(3.6, 1.2, 1.6); gCarBody.translate(0, 0.6, 0);
+const gCarCab = new BoxGeometry(2.0, 0.9, 1.5); gCarCab.translate(-0.2, 1.35, 0);
+const gWheel = new CylinderGeometry(0.36, 0.36, 0.4, 16); gWheel.rotateZ(Math.PI/2);
+const matMetal = new MeshStandardMaterial({ color: 0x4a4d50, roughness: 0.9, metalness: 0.2 });
+const matPaints = [0x5a6a77,0x7a3b3b,0x3d5a3d,0x6a5a3d,0x3a3f6a].map(c=>new MeshStandardMaterial({ color:c, roughness:0.85, metalness:0.3 }));
+const matGlass = new MeshStandardMaterial({ color: 0x88a0b5, roughness: 0.2, metalness: 0.0, transparent:true, opacity:0.5 });
+const matTire = new MeshStandardMaterial({ color: 0x1a1a1a, roughness: 1.0, metalness: 0.0 });
+function makeCar(){
+  const g = new Group();
+  const body = new Mesh(gCarBody, matPaints[Math.floor(Math.random()*matPaints.length)]);
+  const cab = new Mesh(gCarCab, matGlass);
+  const wheelPositions = [
+    [ 1.3, 0.36,  0.8], [ 1.3, 0.36, -0.8],
+    [-1.3, 0.36,  0.8], [-1.3, 0.36, -0.8]
+  ];
+  const wheels = wheelPositions.map(p=>{ const w=new Mesh(gWheel, matTire); w.position.set(p[0],p[1],p[2]); return w; });
+  // damage: chance to miss a wheel or tilt
+  wheels.forEach((w,idx)=>{ if(Math.random()<0.18){ w.scale.set(0.001,0.001,0.001); w.visible=false; } });
+  g.add(body, cab, ...wheels);
+  // slight dents by random rotations and scales
+  g.rotation.y = (Math.random()*2-1)*Math.PI;
+  g.rotation.z = (Math.random()*2-1)*0.06;
+  g.position.y = 0.02;
+  const s = 0.95 + Math.random()*0.15; g.scale.set(s,s,s);
+  return g;
+}
+function spawnCarsAlongRoads(count=28){
+  if(useExternalMap) return;
+  let c=0;
+  while(c<count){
+    const onX = Math.random()<0.5;
+    const pos = new Vector3();
+    if(onX){
+      pos.x = (Math.random()*2-1)*1200; pos.z = (Math.random()<0.5? 3.6 : -3.6) + (Math.random()*2-1)*1.2;
+    } else {
+      pos.z = (Math.random()*2-1)*1200; pos.x = (Math.random()<0.5? 3.6 : -3.6) + (Math.random()*2-1)*1.2;
     }
-    g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    g.setAttribute('velocity', new THREE.Float32BufferAttribute(velocities, 3));
-    const m = new PointsMaterial({ color: 0xfff2a8, size: 0.08, transparent: true, opacity: 1.0, depthWrite:false });
-    const p = new Points(g, m); p.userData.life = 0.25 + Math.random()*0.25; p.userData.age = 0;
-    scene.add(p); sparkBursts.push(p);
-  }
-
-  // --- wrecked cars (low-poly)
-  const carGroup = new Group(); scene.add(carGroup);
-  // shared geometries/materials
-  const gCarBody = new BoxGeometry(3.6, 1.2, 1.6); gCarBody.translate(0, 0.6, 0);
-  const gCarCab = new BoxGeometry(2.0, 0.9, 1.5); gCarCab.translate(-0.2, 1.35, 0);
-  const gWheel = new CylinderGeometry(0.36, 0.36, 0.4, 16); gWheel.rotateZ(Math.PI/2);
-  const matMetal = new MeshStandardMaterial({ color: 0x4a4d50, roughness: 0.9, metalness: 0.2 });
-  const matPaints = [0x5a6a77,0x7a3b3b,0x3d5a3d,0x6a5a3d,0x3a3f6a].map(c=>new MeshStandardMaterial({ color:c, roughness:0.85, metalness:0.3 }));
-  const matGlass = new MeshStandardMaterial({ color: 0x88a0b5, roughness: 0.2, metalness: 0.0, transparent:true, opacity:0.5 });
-  const matTire = new MeshStandardMaterial({ color: 0x1a1a1a, roughness: 1.0, metalness: 0.0 });
-  function makeCar(){
-    const g = new Group();
-    const body = new Mesh(gCarBody, matPaints[Math.floor(Math.random()*matPaints.length)]);
-    const cab = new Mesh(gCarCab, matGlass);
-    const wheelPositions = [
-      [ 1.3, 0.36,  0.8], [ 1.3, 0.36, -0.8],
-      [-1.3, 0.36,  0.8], [-1.3, 0.36, -0.8]
-    ];
-    const wheels = wheelPositions.map(p=>{ const w=new Mesh(gWheel, matTire); w.position.set(p[0],p[1],p[2]); return w; });
-    // damage: chance to miss a wheel or tilt
-    wheels.forEach((w,idx)=>{ if(Math.random()<0.18){ w.scale.set(0.001,0.001,0.001); w.visible=false; } });
-    g.add(body, cab, ...wheels);
-    // slight dents by random rotations and scales
-    g.rotation.y = (Math.random()*2-1)*Math.PI;
-    g.rotation.z = (Math.random()*2-1)*0.06;
-    g.position.y = 0.02;
-    const s = 0.95 + Math.random()*0.15; g.scale.set(s,s,s);
-    return g;
-  }
-  function spawnCarsAlongRoads(count=28){
-    let c=0;
-    while(c<count){
-      const onX = Math.random()<0.5;
-      const pos = new Vector3();
-      if(onX){
-        pos.x = (Math.random()*2-1)*1200; pos.z = (Math.random()<0.5? 3.6 : -3.6) + (Math.random()*2-1)*1.2;
-      } else {
-        pos.z = (Math.random()*2-1)*1200; pos.x = (Math.random()<0.5? 3.6 : -3.6) + (Math.random()*2-1)*1.2;
-      }
-      const car = makeCar(); car.position.add(pos);
-      // chance to be heavily wrecked (on side)
-      if(Math.random()<0.2){ car.rotation.x = (Math.random()*2-1)*0.9; car.rotation.z = (Math.random()*2-1)*0.6; }
-  carGroup.add(car);
+    const car = makeCar(); car.position.add(pos);
+    // chance to be heavily wrecked (on side)
+    if(Math.random()<0.2){ car.rotation.x = (Math.random()*2-1)*0.9; car.rotation.z = (Math.random()*2-1)*0.6; }
+carGroup.add(car);
   // 物理エンジン用Box剛体（横倒しの車もあるので、Y方向の中心は地面付近に）
   const halfLen = 3.6*0.5 * 0.9;
   const halfWid = 1.6*0.5 * 0.9;
@@ -999,54 +1049,19 @@
   const center = new THREE.Vector3(car.position.x, halfH, car.position.z);
   addStaticBoxBody(center, halfLen, halfH, halfWid, car.rotation.y||0);
   c++;
-    }
   }
-  spawnCarsAlongRoads(30);
+}
+if(!useExternalMap){ spawnCarsAlongRoads(30); }
 
-  // --- fallen/tilted billboards
-  const signGroup = new Group(); scene.add(signGroup);
-  const gPost = new CylinderGeometry(0.18,0.22,5.2,10); gPost.translate(0,2.6,0);
-  const gBoard = new BoxGeometry(6.0,3.0,0.12); gBoard.translate(0,1.6,0);
-  const matPost = new MeshStandardMaterial({ color:0x666a6f, roughness:0.95, metalness:0.05 });
-  function makePosterTexture(w=512,h=256){
-    const c = document.createElement('canvas'); c.width=w; c.height=h; const ctx = c.getContext('2d');
-    ctx.fillStyle = '#2b2f36'; ctx.fillRect(0,0,w,h);
-    // fake torn edges
-    ctx.fillStyle = 'rgba(240,240,240,0.9)';
-    ctx.fillRect(12,12,w-24,h-24);
-    ctx.globalCompositeOperation='destination-out';
-    for(let i=0;i<28;i++){
-      const rx = 12 + Math.random()*(w-24); const ry = 12 + Math.random()*(h-24);
-      ctx.beginPath(); ctx.arc(rx, ry, 6+Math.random()*22, 0, Math.PI*2); ctx.fill();
-    }
-    ctx.globalCompositeOperation='source-over';
-    ctx.fillStyle = 'rgba(180,40,40,0.85)'; ctx.font = 'bold 56px Segoe UI'; ctx.fillText('SALE 90% OFF', 28, h/2+16);
-    return new CanvasTexture(c);
-  }
-  const posterTex = makePosterTexture();
-  const matBoard = new MeshStandardMaterial({ map: posterTex, roughness:0.9, metalness:0.0 });
-  function makeBillboard(){
-    const g = new Group();
-    const post = new Mesh(gPost, matPost);
-    const board = new Mesh(gBoard, matBoard);
-    g.add(post, board);
-    // random tilt or completely fallen
-    if(Math.random()<0.35){
-      // fallen: lay on ground
-      g.rotation.x = -Math.PI/2 * (0.9 + Math.random()*0.2);
-      g.position.y = 0.02;
-    } else {
-      g.rotation.z = (Math.random()*2-1)*0.4;
-      g.position.y = 0.02;
-    }
-    return g;
-  }
-  function spawnBillboards(n=12){
-    for(let i=0;i<n;i++){
-      const onX = Math.random()<0.5; const b = makeBillboard();
+// --- fallen/tilted billboards
+let signGroup; if(!useExternalMap){ signGroup = new Group(); scene.add(signGroup); }
+function spawnBillboards(n=12){
+  if(useExternalMap) return;
+  for(let i=0;i<n;i++){
+    const onX = Math.random()<0.5; const b = makeBillboard();
   if(onX){ b.position.x = (Math.random()*2-1)*480; b.position.z = (Math.random()<0.5? 10.5 : -10.5) + (Math.random()*2-1)*4; }
   else { b.position.z = (Math.random()*2-1)*480; b.position.x = (Math.random()<0.5? 10.5 : -10.5) + (Math.random()*2-1)*4; }
-      b.rotation.y = Math.random()*Math.PI;
+    b.rotation.y = Math.random()*Math.PI;
   signGroup.add(b);
   // 看板全体の占有領域を薄いBoxで近似
   const halfX = 3.0;   // 横方向
@@ -1055,38 +1070,12 @@
   const centerY = b.position.y + 2.6; // おおよそ地面からの高さ
   const center = new THREE.Vector3(b.position.x, centerY, b.position.z);
   addStaticBoxBody(center, halfX, halfY, halfZ, b.rotation.y||0);
-    }
   }
-  spawnBillboards(14);
+}
+if(!useExternalMap){ spawnBillboards(14); }
 
-  // --- distant skyline ring (emissive window towers beyond map bounds)
-  function makeWindowTextureFar(w=256,h=512){
-    const c=document.createElement('canvas'); c.width=w; c.height=h; const ctx=c.getContext('2d');
-    // base facade
-    ctx.fillStyle='#0d1018'; ctx.fillRect(0,0,w,h);
-    // window grid
-    const cols= Math.floor(w/8), rows=Math.floor(h/10);
-    const colors=['#33c8ff','#ff3fa8','#ffef55','#8f4dff','#66ffee','#ffa3d6'];
-    for(let r=2;r<rows-2;r++){
-      for(let col=1;col<cols-1;col++){
-        if(Math.random()<0.18){
-          const x=col*8 + (Math.random()*2-1)*1;
-          const y=r*10 + (Math.random()*2-1)*1;
-          const cw=5+Math.random()*2, ch=6+Math.random()*2;
-          ctx.globalAlpha=0.9; ctx.fillStyle=colors[(Math.random()*colors.length)|0];
-          ctx.fillRect(x,y,cw,ch);
-        } else if(Math.random()<0.06){
-          // off but faint interior glow
-          const x=col*8, y=r*10; ctx.globalAlpha=0.08; ctx.fillStyle='#8aa'; ctx.fillRect(x+1,y+1,4,5);
-        }
-      }
-    }
-    return new CanvasTexture(c);
-  }
-  const winTexFar = makeWindowTextureFar();
-  const skyGeo = new BoxGeometry(1,1,1);
-  const skyMat = new MeshStandardMaterial({ color: 0x0e1016, roughness: 1.0, metalness: 0.0, emissive: 0xffffff, emissiveMap: winTexFar, emissiveIntensity: 0.9 });
-  const skylineCount = 160;
+// skyline ring
+if(!useExternalMap){
   const skylineInst = new InstancedMesh(skyGeo, skyMat, skylineCount); scene.add(skylineInst);
   const skyDummy = new THREE.Object3D();
   const ringR1 = 560, ringR2 = 880; let si=0;
@@ -1101,1000 +1090,60 @@
     skyDummy.updateMatrix(); skylineInst.setMatrixAt(si++, skyDummy.matrix);
   }
   skylineInst.count = si; skylineInst.instanceMatrix.needsUpdate = true;
+}
 
-  // --- low-lying colored fog sheets for extra neon haze
-  function makeFogSheetTexture(w=256,h=256){
-    const c=document.createElement('canvas'); c.width=w; c.height=h; const ctx=c.getContext('2d');
-    const g=ctx.createLinearGradient(0,0,0,h);
-    g.addColorStop(0,'rgba(0,0,0,0)');
-    g.addColorStop(0.35,'rgba(120,150,255,0.10)');
-    g.addColorStop(0.75,'rgba(255,100,200,0.18)');
-    g.addColorStop(1,'rgba(0,0,0,0)');
-    ctx.fillStyle=g; ctx.fillRect(0,0,w,h);
-    return new CanvasTexture(c);
-  }
-  const fogTex = makeFogSheetTexture();
-  const fogSheets = []; const fogGroup = new Group(); scene.add(fogGroup);
-  function addFogSheet(x,z,w=420,h=120,rot=0){
-    const geo=new PlaneGeometry(w,h); const mat=new MeshBasicMaterial({ map:fogTex, transparent:true, opacity:0.8, depthWrite:false, blending:THREE.AdditiveBlending, side:DoubleSide });
-    const m=new Mesh(geo,mat); m.position.set(x, h*0.5*0.2 + 0.6, z); m.rotation.y = rot; // stand vertical
-    fogGroup.add(m); fogSheets.push({ m, dir:(Math.random()*2-1)*0.2 });
-  }
+// fog sheets
+const fogSheets = []; let fogGroup; if(!useExternalMap){ fogGroup = new Group(); scene.add(fogGroup); }
+function addFogSheet(x,z,w=420,h=120,rot=0){
+  if(useExternalMap) return;
+  const geo=new PlaneGeometry(w,h); const mat=new MeshBasicMaterial({ map:fogTex, transparent:true, opacity:0.8, depthWrite:false, blending:THREE.AdditiveBlending, side:DoubleSide });
+  const m=new Mesh(geo,mat); m.position.set(x, h*0.5*0.2 + 0.6, z); m.rotation.y = rot; // stand vertical
+  fogGroup.add(m); fogSheets.push({ m, dir:(Math.random()*2-1)*0.2 });
+}
+if(!useExternalMap){
   for(let i=0;i<8;i++){
     const onX = Math.random()<0.5;
     if(onX) addFogSheet((Math.random()*2-1)*380, (Math.random()<0.5?-1:1)*60 + (Math.random()*2-1)*120, 420+Math.random()*200, 120+Math.random()*80, Math.random()*0.3-0.15);
     else addFogSheet((Math.random()<0.5?-1:1)*60 + (Math.random()*2-1)*120, (Math.random()*2-1)*380, 420+Math.random()*200, 120+Math.random()*80, Math.random()*0.3-0.15);
   }
-  // (rain removed per request)
+}
 
-  // --- guardrails along road edges (posts + rails)
-  const guardPostGeo = new CylinderGeometry(0.08, 0.08, 1.1, 12);
-  guardPostGeo.translate(0, 0.55, 0);
-  const guardRailGeo = new BoxGeometry(3.0, 0.14, 0.15);
-  guardRailGeo.translate(0, 0.95, 0); // rail height above ground
-  const guardMat = new MeshStandardMaterial({ color: 0xaab0b6, roughness: 0.85, metalness: 0.15 });
-  // layout along long roads: offset from road edges by ~2.5m
-  const railSpan = 3.0; // horizontal span per rail segment
-  const sectionLen = 490; // half-length along each road (1km マップに合わせる)
-  // compute counts
-  const railCountPerSide = Math.floor((sectionLen*2) / railSpan);
-  const postSpacing = 3.0;
-  const postCountPerSide = Math.floor((sectionLen*2) / postSpacing) + 1;
-  const sides = [ // [axis, fixedCoord, offsetOutward]
-    { axis:'x', z:  10.0 },
-    { axis:'x', z: -10.0 },
-    { axis:'z', x:  10.0 },
-    { axis:'z', x: -10.0 },
-  ];
-  const totalPosts = postCountPerSide * sides.length;
-  const totalRails = railCountPerSide * sides.length;
-  const postInst = new InstancedMesh(guardPostGeo, guardMat, totalPosts);
-  const railInst = new InstancedMesh(guardRailGeo, guardMat, totalRails);
-  postInst.castShadow = true; postInst.receiveShadow = true;
-  railInst.castShadow = true; railInst.receiveShadow = true;
-  scene.add(postInst); scene.add(railInst);
-  const tmp = new THREE.Object3D();
-  let pi = 0, ri = 0;
-  sides.forEach(side=>{
-    // posts
-    for(let i=0;i<postCountPerSide;i++){
-      const t = -sectionLen + i*postSpacing;
-      const broken = Math.random()<0.07; // missing post
-      tmp.rotation.set(0,0,0);
-      if(side.axis==='x'){
-        tmp.position.set(t, 0.02, side.z);
-        tmp.rotation.y = (Math.random()*2-1)*0.06;
-      } else {
-        tmp.position.set(side.x, 0.02, t);
-        tmp.rotation.y = (Math.random()*2-1)*0.06;
-      }
-      // tilt variation
-      tmp.rotation.z = (Math.random()*2-1)*0.06;
-      tmp.updateMatrix();
-      if(!broken){ postInst.setMatrixAt(pi++, tmp.matrix); }
-    }
-    // rails
-    for(let i=0;i<railCountPerSide;i++){
-      const t = -sectionLen + i*railSpan + railSpan*0.5;
-      const broken = Math.random()<0.12; // missing rail
-      tmp.rotation.set(0,0,0);
-      if(side.axis==='x'){
-        tmp.position.set(t, 0.02, side.z);
-        tmp.rotation.y = 0;
-      } else {
-        tmp.position.set(side.x, 0.02, t);
-        tmp.rotation.y = Math.PI/2;
-      }
-      // slight vertical variance to look bent
-      tmp.position.y += (Math.random()*2-1)*0.04;
-      // occasional heavy bend
-      if(Math.random()<0.08){ tmp.rotation.z = (Math.random()*2-1)*0.25; }
-      tmp.updateMatrix();
-      if(!broken){ railInst.setMatrixAt(ri++, tmp.matrix); }
-    }
-  });
-  postInst.count = pi; postInst.instanceMatrix.needsUpdate = true;
-  railInst.count = ri; railInst.instanceMatrix.needsUpdate = true;
+// dust particles
+const dustGeo = new BufferGeometry();
+const dustCount = 800;
+const posArr = new Float32Array(dustCount*3);
+// ダスト粒子の広がり範囲（地形縮小に合わせて調整）
+const baseXZ = 140, baseY = 0.6;
+for(let i=0;i<dustCount;i++){
+  posArr[i*3+0] = (Math.random()*2-1)*baseXZ;
+  posArr[i*3+1] = baseY + Math.random()*2.5;
+  posArr[i*3+2] = (Math.random()*2-1)*baseXZ;
+}
+dustGeo.setAttribute('position', new THREE.Float32BufferAttribute(posArr, 3));
+const dustMat = new PointsMaterial({ color: 0xb7bdc3, size: 0.18, sizeAttenuation: true, transparent: true, opacity: 0.25, depthWrite: false });
+const dustPoints = new Points(dustGeo, dustMat); if(!useExternalMap){ scene.add(dustPoints); }
 
-  // --- traffic cones (body + base instanced)
-  const coneCount = 120;
-  const coneBodyGeo = new ConeGeometry(0.32, 0.7, 24);
-  coneBodyGeo.translate(0, 0.35, 0);
-  const coneBaseGeo = new CylinderGeometry(0.36, 0.36, 0.06, 20);
-  coneBaseGeo.translate(0, 0.03, 0);
-  const coneMat = new MeshStandardMaterial({ color: 0xd96a1a, roughness: 0.9, metalness: 0.05 });
-  const coneBaseMat = new MeshStandardMaterial({ color: 0x333333, roughness: 1.0, metalness: 0.0 });
-  const coneInst = new InstancedMesh(coneBodyGeo, coneMat, coneCount);
-  const coneBaseInst = new InstancedMesh(coneBaseGeo, coneBaseMat, coneCount);
-  coneInst.castShadow = true; coneInst.receiveShadow = true; coneBaseInst.castShadow = true; coneBaseInst.receiveShadow = true;
-  scene.add(coneInst); scene.add(coneBaseInst);
-  let ci = 0; const cDummy = new THREE.Object3D();
-  function placeCone(x,z){
-    cDummy.position.set(x, 0.02, z);
-    cDummy.rotation.y = Math.random()*Math.PI*2;
-    cDummy.rotation.z = (Math.random()*2-1)*0.12;
-    const s = 0.9 + Math.random()*0.25; cDummy.scale.set(s,s,s);
-    cDummy.updateMatrix();
-    coneInst.setMatrixAt(ci, cDummy.matrix);
-    coneBaseInst.setMatrixAt(ci, cDummy.matrix);
-    ci++;
-  }
-  // scatter cones near intersection and random road segments
-  for(let i=0;i<40;i++){
-    placeCone((Math.random()*2-1)*12, (Math.random()*2-1)*12);
-  }
-  for(let i=0;i<40;i++){
-  placeCone((Math.random()*2-1)*480, (Math.random()<0.5? 6.5 : -6.5) + (Math.random()*2-1)*3);
-  }
-  for(let i=0;i<40;i++){
-  placeCone((Math.random()<0.5? 6.5 : -6.5) + (Math.random()*2-1)*3, (Math.random()*2-1)*480);
-  }
-  coneInst.count = ci; coneBaseInst.count = ci;
-  coneInst.instanceMatrix.needsUpdate = true; coneBaseInst.instanceMatrix.needsUpdate = true;
-
-  // streetlights (poles instanced + point lights + small emissive heads)
-  const lampPositions = [];
-  // along roadA (x-axis road), place rows at z=±7
-  for(let x=-480; x<=480; x+=40){ lampPositions.push(new Vector3(x,0,7)); lampPositions.push(new Vector3(x,0,-7)); }
-  // along roadB (z-axis road), place rows at x=±7
-  for(let z=-480; z<=480; z+=40){ lampPositions.push(new Vector3(7,0,z)); lampPositions.push(new Vector3(-7,0,z)); }
-  const poleGeo = new CylinderGeometry(0.08, 0.1, 5.2, 10);
-  poleGeo.translate(0, 2.6, 0);
-  const poleMat = new MeshStandardMaterial({ color: 0x6b6f75, roughness: 0.9, metalness: 0.05 });
-  const poleInst = new InstancedMesh(poleGeo, poleMat, lampPositions.length);
-  poleInst.castShadow = false; poleInst.receiveShadow = true; scene.add(poleInst);
-  const lampLights = []; const lampMeshes = []; const lampFlick = [];
-  const lampHeadGeo = new BoxGeometry(0.36,0.18,0.36);
-  const lampHeadMat = new MeshStandardMaterial({ color: 0x111111, emissive: 0x99bbff, emissiveIntensity: 1.0, roughness: 0.6, metalness: 0.0 });
-  const dummyObj = new THREE.Object3D();
-  lampPositions.forEach((p, i)=>{
-    // offset from ground (y from flat base)
-    const baseY = 0; // ground baseline
-    dummyObj.position.set(p.x, baseY, p.z);
-    // small lateral offset outward from road center
-    if (Math.abs(p.z) > 0) dummyObj.position.z += (p.z>0? 1.0 : -1.0);
-    if (Math.abs(p.x) > 0 && Math.abs(p.z) < 0.001) dummyObj.position.x += (p.x>0? 1.0 : -1.0);
-    dummyObj.rotation.set(0, 0, 0);
-    dummyObj.updateMatrix();
-    poleInst.setMatrixAt(i, dummyObj.matrix);
-    // lamp head mesh
-    const head = new Mesh(lampHeadGeo, lampHeadMat.clone());
-    head.position.set(dummyObj.position.x, baseY + 5.1, dummyObj.position.z);
-    head.castShadow = false; head.receiveShadow = false; scene.add(head); lampMeshes.push(head);
-    // point light for emission
-  const warm = new PointLight(0x99bbff, 3.0, 16, 2.0);
-    warm.position.set(head.position.x, head.position.y - 0.05, head.position.z);
-  // disable shadows to avoid exceeding sampler limits with many lights
-  warm.castShadow = false; scene.add(warm); lampLights.push(warm);
-    // flicker parameters
-    lampFlick.push({ base: 3.2, speed: 2.0 + Math.random()*1.5, jitter: Math.random()*Math.PI*2, offProb: 0.08 + Math.random()*0.08 });
-  });
-  poleInst.instanceMatrix.needsUpdate = true;
-
-  // utility poles with intermittent arcing light
-  const poleGroup = new THREE.Group(); scene.add(poleGroup);
-  const utilPoles = []; // {mesh, head, light, ctrl}
-  (function spawnUtilityPoles(){
-    const poleGeo = new CylinderGeometry(0.16, 0.2, 7.0, 12); poleGeo.translate(0, 3.5, 0);
-    const poleMat = new MeshStandardMaterial({ color: 0x5e5b58, roughness: 0.95, metalness: 0.05 });
-    const headGeo = new BoxGeometry(0.28,0.22,0.28);
-    const headMat = new MeshStandardMaterial({ color: 0x222222, emissive: 0x99ccff, emissiveIntensity: 0.0, roughness:0.7, metalness:0.0 });
-    // positions along roads every ~300m
-    const positions = [];
-  for(let x=-480; x<=480; x+=240){ positions.push(new Vector3(x,0, 11.8)); positions.push(new Vector3(x,0, -11.8)); }
-  for(let z=-480; z<=480; z+=240){ positions.push(new Vector3(11.8,0, z)); positions.push(new Vector3(-11.8,0, z)); }
-    positions.forEach(p=>{
-      const m = new Mesh(poleGeo, poleMat);
-      m.position.set(p.x, 0.02, p.z);
-      m.rotation.y = (Math.random()*2-1)*0.2; m.rotation.z = (Math.random()*2-1)*0.05;
-      poleGroup.add(m);
-      const head = new Mesh(headGeo, headMat.clone());
-      head.position.set(p.x + (Math.random()*2-1)*0.15, 6.8 + (Math.random()*2-1)*0.1, p.z + (Math.random()*2-1)*0.15);
-      scene.add(head);
-      const arc = new PointLight(0xa9d6ff, 0.0, 16, 2.2); arc.position.copy(head.position); arc.castShadow = false; scene.add(arc);
-      const ctrl = { base: 1.4 + Math.random()*1.6, speed: 3.0 + Math.random()*3.0, jitter: Math.random()*Math.PI*2, offProb: 0.1 + Math.random()*0.08, nextSpark: 0 };
-      utilPoles.push({ mesh:m, head, light:arc, ctrl });
-    });
-  })();
-
-  // simple concrete barricades (instanced boxes) near the intersection corners
-  const barricadePositions = [];
-  function addBarricadeCluster(cx, cz, count=12, spread=6){
-    for(let i=0;i<count;i++){
-      const ox = (Math.random()*2-1)*spread;
-      const oz = (Math.random()*2-1)*spread;
-      barricadePositions.push(new Vector3(cx+ox, 0, cz+oz));
-    }
-  }
-  addBarricadeCluster(16, 16); addBarricadeCluster(-16, 16); addBarricadeCluster(16, -16); addBarricadeCluster(-16, -16);
-  const barGeo = new BoxGeometry(1.6,0.9,0.6);
-  const barMat = new MeshStandardMaterial({ color: 0x8b8f95, roughness: 0.95, metalness: 0.0 });
-  const barInst = new InstancedMesh(barGeo, barMat, barricadePositions.length);
-  const barDummy = new THREE.Object3D();
-  barricadePositions.forEach((p, i)=>{
-    barDummy.position.set(p.x, 0.45, p.z);
-    barDummy.rotation.y = (Math.random()*2-1)*0.7;
-    barDummy.rotation.z = (Math.random()*2-1)*0.12;
-    const s = 0.9 + Math.random()*0.2; barDummy.scale.set(s, s, s);
-    barDummy.updateMatrix(); barInst.setMatrixAt(i, barDummy.matrix);
-  // 物理エンジン用Box剛体
-  const halfX = 1.6 * 0.5 * s;
-  const halfY = 0.9 * 0.5 * s;
-  const halfZ = 0.6 * 0.5 * s;
-  const center = new THREE.Vector3(p.x, 0.45, p.z);
-  addStaticBoxBody(center, halfX, halfY, halfZ, barDummy.rotation.y||0);
-  });
-  barInst.castShadow = true; barInst.receiveShadow = true; scene.add(barInst);
-
-  // subtle dust particles (points)
-  const dustGeo = new BufferGeometry();
-  const dustCount = 800;
-  const posArr = new Float32Array(dustCount*3);
-  // ダスト粒子の広がり範囲（地形縮小に合わせて調整）
-  const baseXZ = 140, baseY = 0.6;
-  for(let i=0;i<dustCount;i++){
-    posArr[i*3+0] = (Math.random()*2-1)*baseXZ;
-    posArr[i*3+1] = baseY + Math.random()*2.5;
-    posArr[i*3+2] = (Math.random()*2-1)*baseXZ;
-  }
-  dustGeo.setAttribute('position', new THREE.Float32BufferAttribute(posArr, 3));
-  const dustMat = new PointsMaterial({ color: 0xb7bdc3, size: 0.18, sizeAttenuation: true, transparent: true, opacity: 0.25, depthWrite: false });
-  const dustPoints = new Points(dustGeo, dustMat); scene.add(dustPoints);
-
-  // --- enemies: shadow humanoids (黒い人型、いびつな歩行 + リム発光)
-  const enemyGroup = new Group(); scene.add(enemyGroup);
-  const enemies = [];
-  // 共有ジオメトリ/マテリアル（ピボットを肩・股関節に）
-  // リム発光: フレネル近似でシルエットに発光を乗せる
-  // ベースのリムマテリアル（クローンして個体差を付与）
-  const rimMat = new ShaderMaterial({
-    uniforms: {
-      time: { value: 0 },
-      baseColor: { value: new Color(0x000000) },
-      rimColor: { value: new Color(0x88aaff) },
-      rimStrength: { value: 2.0 },
-      rimPower: { value: 2.4 },
-      flickerAmp: { value: 0.25 },
-      flickerRate: { value: 1.7 },
-      // 有機的な“柔らかさ”追加用
-      organicAmp: { value: 0.0 },      // 頂点変位振幅（個体ごとに設定）
-      noiseScale: { value: 3.5 },      // 変位ノイズの周波数
-      pulseRate: { value: 0.0 },       // 脈動速度
-      seed: { value: 0.0 }             // 個体ごとのシード
-    },
-    vertexShader: `
-      uniform float time; 
-      uniform float organicAmp; 
-      uniform float noiseScale; 
-      uniform float seed; 
-      varying vec3 vWorldNormal; 
-      varying vec3 vWorldPos; 
-      // 簡易 3 軸サインノイズで柔らかな鼓動風の変位
-      void main(){
-        float n1 = sin(position.x*noiseScale + time*0.7 + seed);
-        float n2 = sin(position.y*noiseScale*1.3 + time*1.2 + seed*2.0);
-        float n3 = sin(position.z*noiseScale*0.9 + time*0.5 + seed*3.0);
-        float disp = organicAmp * (n1 + n2 + n3) / 3.0; // 法線方向へ平均変位
-        vec3 displaced = position + normalize(normal) * disp;
-        vec4 wp = modelMatrix * vec4(displaced,1.0);
-        vWorldPos = wp.xyz;
-        vWorldNormal = normalize(mat3(modelMatrix) * normal);
-        gl_Position = projectionMatrix * viewMatrix * wp;
-      }
-    `,
-    fragmentShader: `
-      uniform vec3 baseColor; 
-      uniform vec3 rimColor; 
-      uniform float rimStrength; 
-      uniform float rimPower; 
-      uniform float flickerAmp; 
-      uniform float flickerRate; 
-      uniform float time; 
-      uniform float pulseRate; 
-      uniform float seed; 
-      varying vec3 vWorldNormal; 
-      varying vec3 vWorldPos; 
-      void main(){
-        vec3 V = normalize(cameraPosition - vWorldPos);
-        float fres = pow(1.0 - max(dot(normalize(vWorldNormal), V), 0.0), rimPower);
-        float flicker = 1.0 + flickerAmp * (sin(time*flickerRate + vWorldPos.x*0.7 + vWorldPos.y*1.3)+sin(time*1.1 + vWorldPos.z*0.9))*0.5;
-        float pulse = 0.85 + 0.35 * sin(time*pulseRate + seed*6.123); // 個体別脈動
-        vec3 col = baseColor + rimColor * (fres * rimStrength * flicker * pulse);
-        gl_FragColor = vec4(col, 1.0);
-      }
-    `,
-    transparent: false
-  });
-  function makeLimbCyl(h, rTop=0.17, rBot=0.19, seg=14){
-    // 円柱（テーパー）で四肢を作る。関節側が原点（上）になるよう下方向へオフセット
-    const g = new CylinderGeometry(rTop, rBot, h, seg);
-    g.translate(0, -h*0.5, 0);
-    return g;
-  }
-  function makeFootBox(len=0.26, h=0.07, w=0.10){
-    // 足: 足首（上背側）をピボットに、つま先が前へ出る形
-    const g = new BoxGeometry(w, h, len);
-    g.translate(0, -h*0.5, len*0.25);
-    return g;
-  }
-  function makePalmBox(w=0.12, h=0.04, d=0.14){
-    // 掌: 手首をピボット（上背側）に、指方向へ少し前出し
-    const g = new BoxGeometry(w, h, d);
-    g.translate(0, -h*0.5, d*0.25);
-    return g;
-  }
-  const GEO = {
-    // より痩せ型：幅・半径を全体的に細く、長さはやや延長
-    torso: new BoxGeometry(0.40, 1.06, 0.22), // 互換用（未使用）
-    upperTorso: new BoxGeometry(0.38, 0.56, 0.22), // 肋骨まわり
-    lowerTorso: new BoxGeometry(0.36, 0.48, 0.20), // 骨盤まわり
-    neck:       new CylinderGeometry(0.06, 0.07, 0.12, 12),
-    head:  new THREE.SphereGeometry(0.14, 20, 20),
-    upperArm: makeLimbCyl(0.48, 0.09, 0.11),
-    lowerArm: makeLimbCyl(0.44, 0.08, 0.10),
-    hand:     makePalmBox(0.12, 0.04, 0.14), // 掌ボックス
-    fingerProx: makeLimbCyl(0.11, 0.035, 0.045),
-    fingerMid:  makeLimbCyl(0.10, 0.03,  0.04),
-    fingerDist: makeLimbCyl(0.09,  0.028, 0.035),
-    upperLeg: makeLimbCyl(0.56, 0.12, 0.16),
-    lowerLeg: makeLimbCyl(0.50, 0.11, 0.15),
-    foot:     makeFootBox(0.28, 0.07, 0.10)
-  };
-  function cloneRimForEntity(){
-    const m = rimMat.clone();
-    // deep-clone uniforms so each entity can vary independently
-    m.uniforms = THREE.UniformsUtils.clone(rimMat.uniforms);
-    // slight per-instance defaults (disabled for humans by default)
-    m.uniforms.seed.value = Math.random()*10.0;
-    m.uniforms.pulseRate.value = 0.0;
-    m.uniforms.organicAmp.value = 0.0;
-    return m;
-  }
-  function buildShadowHumanoid(targetHeight){
-    const root = new Group();
-    // ノード構成（簡易ボーン風の階層）
-    const hips = new Group(); hips.position.set(0, 1.0, 0); root.add(hips);
-    // 骨盤（下胴）と胸郭（上胴）に分割し、肩は上胴の子に
-  const humanMat = cloneRimForEntity(); // 人型はデフォルト有機変形オフ
-  const lowerTorso = new Mesh(GEO.lowerTorso, humanMat); lowerTorso.position.set(0, 0.30, 0); hips.add(lowerTorso);
-    // 追加: 脊柱中間グループで滑らかなひねり表現
-    const spineMid = new Group(); spineMid.position.set(0, 0.60, 0); hips.add(spineMid);
-  const upperTorso = new Mesh(GEO.upperTorso, humanMat); upperTorso.position.set(0, 0.10, 0); spineMid.add(upperTorso);
-  const neck = new Mesh(GEO.neck, humanMat); neck.position.set(0, 0.98, 0); upperTorso.add(neck);
-  const head = new Mesh(GEO.head, humanMat); head.position.set(0, 0.14, 0); head.scale.set(0.9, 1.15, 0.9); neck.add(head);
-    // 腕チェーン（鎖骨→肩）
-    const clavicleL = new Group(); clavicleL.position.set(+0.22, 0.18, 0); upperTorso.add(clavicleL);
-    const shoulderL = new Group(); shoulderL.position.set(+0.04, -0.06, 0); clavicleL.add(shoulderL);
-  const upperArmL = new Mesh(GEO.upperArm, humanMat); upperArmL.position.set(0, 0, 0); shoulderL.add(upperArmL);
-    const elbowL = new Group(); elbowL.position.set(0, -0.42, 0); shoulderL.add(elbowL);
-  const lowerArmL = new Mesh(GEO.lowerArm, humanMat); lowerArmL.position.set(0, 0, 0); elbowL.add(lowerArmL);
-    const wristL = new Group(); wristL.position.set(0, -0.38, 0); elbowL.add(wristL);
-  const handL = new Mesh(GEO.hand, humanMat); handL.position.set(0, 0, 0.0); wristL.add(handL);
-    // 左手の指（親指+4本）
-    function buildHandFingers(parent, side){
-      const fingers = [];
-      const isLeft = side === 'L';
-      const sgn = isLeft ? 1 : -1; // 外側方向
-      // 親指は基部を内側・前方にずらし、外旋
-      const bases = [
-        {x: sgn*0.035, z:-0.02, splay: sgn*0.35, yaw: sgn*0.35}, // thumb
-        {x: sgn*0.025, z: 0.00, splay: sgn*0.10, yaw: 0.0},      // index
-        {x: sgn*0.000, z: 0.01, splay: 0.0,         yaw: 0.0},   // middle
-        {x: sgn*-0.020, z: 0.00, splay: -sgn*0.10,  yaw: 0.0},   // ring
-        {x: sgn*-0.035, z:-0.01, splay: -sgn*0.18,  yaw: 0.0},   // little
-      ];
-      for(let fi=0; fi<5; fi++){
-        const b = new Group(); b.position.set(bases[fi].x, -0.015, 0.06 + bases[fi].z); parent.add(b);
-        b.rotation.y = bases[fi].yaw;
-        const prox = new Mesh(GEO.fingerProx, rimMat); prox.position.set(0,0,0); b.add(prox);
-        const midG = new Group(); midG.position.set(0, -0.095, 0); b.add(midG);
-        const mid = new Mesh(GEO.fingerMid, rimMat); mid.position.set(0,0,0); midG.add(mid);
-        const tipG = new Group(); tipG.position.set(0, -0.085, 0); midG.add(tipG);
-        const tip = new Mesh(GEO.fingerDist, rimMat); tip.position.set(0,0,0); tipG.add(tip);
-        fingers.push({ base:b, prox, midG, mid, tipG, tip, splayBase: bases[fi].splay });
-      }
-      return fingers;
-    }
-    const fingersL = buildHandFingers(handL, 'L');
-
-    const clavicleR = new Group(); clavicleR.position.set(-0.22, 0.18, 0); upperTorso.add(clavicleR);
-    const shoulderR = new Group(); shoulderR.position.set(-0.04, -0.06, 0); clavicleR.add(shoulderR);
-  const upperArmR = new Mesh(GEO.upperArm, humanMat); upperArmR.position.set(0, 0, 0); shoulderR.add(upperArmR);
-    const elbowR = new Group(); elbowR.position.set(0, -0.42, 0); shoulderR.add(elbowR);
-  const lowerArmR = new Mesh(GEO.lowerArm, humanMat); lowerArmR.position.set(0, 0, 0); elbowR.add(lowerArmR);
-    const wristR = new Group(); wristR.position.set(0, -0.38, 0); elbowR.add(wristR);
-  const handR = new Mesh(GEO.hand, humanMat); handR.position.set(0, 0, 0.0); wristR.add(handR);
-    const fingersR = buildHandFingers(handR, 'R');
-
-    // 脚チェーン
-  const hipL = new Group(); hipL.position.set(+0.11, 0.0, 0); hips.add(hipL);
-  const upperLegL = new Mesh(GEO.upperLeg, humanMat); upperLegL.position.set(0, 0, 0); hipL.add(upperLegL);
-    const kneeL = new Group(); kneeL.position.set(0, -0.46, 0); hipL.add(kneeL);
-  const lowerLegL = new Mesh(GEO.lowerLeg, humanMat); lowerLegL.position.set(0, 0, 0); kneeL.add(lowerLegL);
-    const ankleL = new Group(); ankleL.position.set(0, -0.40, 0); kneeL.add(ankleL);
-  const footL = new Mesh(GEO.foot, humanMat); footL.position.set(0, 0, 0); ankleL.add(footL);
-
-  const hipR = new Group(); hipR.position.set(-0.11, 0.0, 0); hips.add(hipR);
-  const upperLegR = new Mesh(GEO.upperLeg, humanMat); upperLegR.position.set(0, 0, 0); hipR.add(upperLegR);
-    const kneeR = new Group(); kneeR.position.set(0, -0.46, 0); hipR.add(kneeR);
-  const lowerLegR = new Mesh(GEO.lowerLeg, humanMat); lowerLegR.position.set(0, 0, 0); kneeR.add(lowerLegR);
-    const ankleR = new Group(); ankleR.position.set(0, -0.40, 0); kneeR.add(ankleR);
-  const footR = new Mesh(GEO.foot, humanMat); footR.position.set(0, 0, 0); ankleR.add(footR);
-
-  // 身長スケール調整：ターゲット身長に正規化（デフォルト2.45m程度）
-  const tgt = (typeof targetHeight === 'number' && isFinite(targetHeight)) ? targetHeight : 2.45;
-  const approxTotal = 2.30; // 上下胴+首込みの目安高さ（スケール前）
-  const SCALE = tgt / approxTotal;
-  root.scale.setScalar(SCALE);
-  return {
-    kind: 'human',
-    root,
-    hips, spineMid, upperTorso, lowerTorso, neck, head,
-    clavicleL, shoulderL, elbowL, wristL, handL, fingersL,
-    clavicleR, shoulderR, elbowR, wristR, handR, fingersR,
-    hipL, upperLegL, kneeL, lowerLegL, ankleL, footL,
-    hipR, upperLegR, kneeR, lowerLegR, ankleR, footR
-  };
-  }
-  // 四足獣モデル
-  function buildShadowBeast(targetHeight){
-    const root = new Group();
-    const beastMat = cloneRimForEntity();
-    // 有機パラメータ: 個体差を付けて脈動と柔らかさ
-    beastMat.uniforms.organicAmp.value = 0.045 + Math.random()*0.035; // 0.045-0.08
-    beastMat.uniforms.pulseRate.value = 0.9 + Math.random()*0.6;      // 0.9-1.5 Hz 程度
-    // 形状定義（簡易）
-    const pelvisGeo = new BoxGeometry(0.60,0.30,0.70);
-    const abdomenGeo = new BoxGeometry(0.55,0.28,0.55);
-    const chestGeo = new BoxGeometry(0.70,0.34,0.60);
-    const neckGeo = new CylinderGeometry(0.11,0.13,0.30,12);
-    const headGeo = new BoxGeometry(0.34,0.26,0.40);
-    const jawGeo = new BoxGeometry(0.34,0.10,0.32);
-    const foreUpper = new CylinderGeometry(0.13,0.16,0.78,14); foreUpper.translate(0,-0.39,0);
-    const foreLower = new CylinderGeometry(0.11,0.14,0.72,14); foreLower.translate(0,-0.36,0);
-    const foreClaw = new BoxGeometry(0.36,0.16,0.42); foreClaw.translate(0,-0.08,0.05);
-    const thighGeo = new CylinderGeometry(0.18,0.22,0.70,14); thighGeo.translate(0,-0.35,0);
-    const shankGeo = new CylinderGeometry(0.14,0.18,0.64,14); shankGeo.translate(0,-0.32,0);
-    const hoofGeo = new BoxGeometry(0.30,0.14,0.42); hoofGeo.translate(0,-0.07,0.10);
-    // 脊柱
-    const spineRoot = new Group(); spineRoot.position.set(0, 0.95, 0); root.add(spineRoot);
-  const pelvis = new Mesh(pelvisGeo, beastMat); pelvis.position.set(0, 0.00, -0.30); spineRoot.add(pelvis);
-    const spineA = new Group(); spineA.position.set(0, 0.08, -0.10); spineRoot.add(spineA);
-  const abdomen = new Mesh(abdomenGeo, beastMat); abdomen.position.set(0, 0.02, 0.00); spineA.add(abdomen);
-    const spineB = new Group(); spineB.position.set(0, 0.10, 0.20); spineA.add(spineB);
-    const spineC = new Group(); spineC.position.set(0, 0.10, 0.40); spineB.add(spineC);
-    const spineD = new Group(); spineD.position.set(0, 0.10, 0.58); spineC.add(spineD);
-  const chest = new Mesh(chestGeo, beastMat); chest.position.set(0, 0.02, 0.15); spineD.add(chest);
-    // 首と頭
-  const neck = new Mesh(neckGeo, beastMat); neck.position.set(0, 0.14, 0.55); chest.add(neck);
-  const head = new Mesh(headGeo, beastMat); head.position.set(0, 0.10, 0.20); neck.add(head);
-    const jawPivot = new Group(); jawPivot.position.set(0, -0.06, 0.08); head.add(jawPivot);
-  const jaw = new Mesh(jawGeo, beastMat); jaw.position.set(0, 0, 0); jawPivot.add(jaw);
-    // 前肢
-    const scapulaL = new Group(); scapulaL.position.set(+0.34, 0.05, 0.35); chest.add(scapulaL);
-    const shoulderL = new Group(); shoulderL.position.set(0.02, -0.04, 0.02); scapulaL.add(shoulderL);
-  const foreUpL = new Mesh(foreUpper, beastMat); shoulderL.add(foreUpL);
-    const elbowL = new Group(); elbowL.position.set(0, -0.72, 0); shoulderL.add(elbowL);
-  const foreLoL = new Mesh(foreLower, beastMat); elbowL.add(foreLoL);
-    const wristL = new Group(); wristL.position.set(0, -0.70, 0); elbowL.add(wristL);
-  const clawL = new Mesh(foreClaw, beastMat); wristL.add(clawL);
-    const scapulaR = new Group(); scapulaR.position.set(-0.34, 0.05, 0.35); chest.add(scapulaR);
-    const shoulderR = new Group(); shoulderR.position.set(-0.02, -0.04, 0.02); scapulaR.add(shoulderR);
-  const foreUpR = new Mesh(foreUpper, beastMat); shoulderR.add(foreUpR);
-    const elbowR = new Group(); elbowR.position.set(0, -0.72, 0); shoulderR.add(elbowR);
-  const foreLoR = new Mesh(foreLower, beastMat); elbowR.add(foreLoR);
-    const wristR = new Group(); wristR.position.set(0, -0.70, 0); elbowR.add(wristR);
-  const clawR = new Mesh(foreClaw, beastMat); wristR.add(clawR);
-    // 後肢
-    const hipL = new Group(); hipL.position.set(+0.24, -0.02, -0.28); pelvis.add(hipL);
-  const thighL = new Mesh(thighGeo, beastMat); hipL.add(thighL);
-    const kneeL = new Group(); kneeL.position.set(0, -0.62, 0); hipL.add(kneeL);
-  const shankL = new Mesh(shankGeo, beastMat); kneeL.add(shankL);
-    const ankleL = new Group(); ankleL.position.set(0, -0.58, 0.02); kneeL.add(ankleL);
-  const hoofL = new Mesh(hoofGeo, beastMat); ankleL.add(hoofL);
-    const hipR = new Group(); hipR.position.set(-0.24, -0.02, -0.28); pelvis.add(hipR);
-  const thighR = new Mesh(thighGeo, beastMat); hipR.add(thighR);
-    const kneeR = new Group(); kneeR.position.set(0, -0.62, 0); hipR.add(kneeR);
-  const shankR = new Mesh(shankGeo, beastMat); kneeR.add(shankR);
-    const ankleR = new Group(); ankleR.position.set(0, -0.58, 0.02); kneeR.add(ankleR);
-  const hoofR = new Mesh(hoofGeo, beastMat); ankleR.add(hoofR);
-    // 身長スケール
-    const tgt = (typeof targetHeight === 'number' && isFinite(targetHeight)) ? targetHeight : 2.6;
-    const approxTotal = 2.3;
-    const SCALE = tgt / approxTotal; root.scale.setScalar(SCALE);
-    return {
-      kind: 'beast',
-      root,
-      spineRoot, spineA, spineB, spineC, spineD, chest, abdomen, neck, head, jaw: jawPivot,
-      scapulaL, shoulderL, elbowL, wristL, clawL,
-      scapulaR, shoulderR, elbowR, wristR, clawR,
-      hipL, thighL, kneeL, shankL, ankleL, hoofL,
-      hipR, thighR, kneeR, shankR, ankleR, hoofR,
-      pelvis,
-      torso: chest,
-      material: beastMat
-    };
-  }
-  function createShadowEnemy(x, z){
-  // 生成時は全て四足獣（必要なら値を下げて混在に戻せます）
-  const BEAST_RATIO = 1.0;
-    const HEIGHT_RANGE_MIN = 2.55; // 身長最小 (m)
-    const HEIGHT_RANGE_MAX = 2.90; // 身長最大 (m)
-    const targetH = HEIGHT_RANGE_MIN + Math.random()*(HEIGHT_RANGE_MAX-HEIGHT_RANGE_MIN);
-    const useBeast = Math.random() < BEAST_RATIO;
-    const parts = useBeast ? buildShadowBeast(targetH) : buildShadowHumanoid(targetH);
-    const g = parts.root; g.position.set(x, 0.02, z); enemyGroup.add(g);
-    // 簡易当たり判定半径（獣は大きめ）
-    const colR = parts.kind==='beast' ? (0.95 + Math.random()*0.15) : (0.55 + Math.random()*0.15);
-    return {
-      node: g,
-      parts,
-      t: Math.random()*1000,
-  speed: 0.65 + Math.random()*0.55, // やや遅いが身長でストライド長を錯覚（不気味さ）
-      dir: Math.random()*Math.PI*2,
-      walkPhase: Math.random()*Math.PI*2,
-  walkRate: parts.kind==='beast' ? (2.2 + Math.random()*1.2) : (3.0 + Math.random()*1.5), // 四足はやや低め周期
-  legAmp: parts.kind==='beast' ? (0.55 + Math.random()*0.25) : (0.75 + Math.random()*0.30), // 四足は控えめ
-  armAmp: parts.kind==='beast' ? (0.65 + Math.random()*0.30) : (0.9 + Math.random()*0.35),  // 前肢
-      headJit: Math.random()*Math.PI*2,
-      sway: Math.random()*Math.PI*2,
-      freeze: 0, // 瞬間停止（不気味さ）
-      lean: (Math.random()*2-1)*0.15, // 体幹の傾きベース
-  baseHipY: parts.hips ? parts.hips.position.y : 1.0,
-  baseSpineY: parts.spineRoot ? parts.spineRoot.position.y : 1.0,
-      height: targetH,
-      // くねくね用パラメータ（関節の不規則なうねり・伸縮・痙攣）
-  wobbleA: (parts.kind==='beast'? 0.9 : 1.2) + Math.random()*1.0,       // 胴体第一うねり周波数
-  wobbleB: (parts.kind==='beast'? 1.8 : 2.2) + Math.random()*1.6,       // 胴体第二うねり周波数
-  bendAmp: (parts.kind==='beast'? 0.35 : 0.25) + Math.random()*0.25,     // 胴の大きなうねり振幅（四足は増）
-  neckStretchAmp: (parts.kind==='beast'? 0.18 : 0.12) + Math.random()*0.12, // 首伸縮振幅（獣は強め）
-  shoulderRollAmp: (parts.kind==='beast'? 0.18 : 0.25) + Math.random()*0.15, // 鎖骨/肩ロール
-  // 前肢の側方スプレイ量（獣のみ使用）
-  foreSplayAmp: parts.kind==='beast' ? (0.15 + Math.random()*0.25) : 0.0,
-  // 初期肩甲骨の左右位置（外側スプレイの基準）
-  baseScapulaLX: (parts.scapulaL ? parts.scapulaL.position.x : 0),
-  baseScapulaRX: (parts.scapulaR ? parts.scapulaR.position.x : 0),
-      sideSlide: Math.random()<0.5,
-      kneeFlipT: 0, // 膝の過伸展フェーズ
-      stretchT: 0,  // 首/腕の伸縮フェーズ
-      spasmT: 0,    // 微痙攣フェーズ
-      snapCD: 1.5 + Math.random()*2.0, // 向きスナップのクールダウン
-      // マテリアル個体差（有機変形を部位に反映するため root の material を拾う）
-      mat: (parts.material||null),
-      colR
-    };
-  }
-  function spawnEnemies(n=6){
-    for(let i=0;i<n;i++){
+// enemies
+let enemyGroup; if(!useExternalMap){ enemyGroup = new Group(); scene.add(enemyGroup); }
+function spawnEnemies(n=6){
+  if(useExternalMap) return;
+  for(let i=0;i<n;i++){
     const ang = Math.random()*Math.PI*2; const dist = 30 + Math.random()*60; // 縮小マップに合わせスポーン距離短縮
       const ex = camera.position.x + Math.cos(ang)*dist;
       const ez = camera.position.z + Math.sin(ang)*dist;
       enemies.push(createShadowEnemy(ex, ez));
-    }
   }
-  spawnEnemies(7);
+}
+if(!useExternalMap){ spawnEnemies(7); }
 
-  // night sky: stars
-  (function addStars(){
-    const starN = 1200; const g = new BufferGeometry();
-    const arr = new Float32Array(starN*3);
-    for(let i=0;i<starN;i++){
-      const r = 1800 + Math.random()*1200;
-      const ang = Math.random()*Math.PI*2;
-      const h = 600 + Math.random()*800;
-      arr[i*3+0] = Math.cos(ang)*r;
-      arr[i*3+1] = h;
-      arr[i*3+2] = Math.sin(ang)*r;
-    }
-    g.setAttribute('position', new THREE.Float32BufferAttribute(arr,3));
-    const m = new PointsMaterial({ color:0xcfd8ff, size:0.9, sizeAttenuation:true, transparent:true, opacity:0.85, depthWrite:false });
-    const stars = new Points(g,m); scene.add(stars);
-  })();
+// updates: guard when external map
+// neon flicker & sparks
+if(useExternalMap){
+  // skip neon updates, spark simulation, dust drift, enemy AI when using external map
+  // Place concise guards inside respective update loops
+}
 
-  // moon: billboarded plane with procedural texture
-  function makeMoonTexture(w=256,h=256){
-    const c=document.createElement('canvas'); c.width=w; c.height=h; const ctx=c.getContext('2d');
-    ctx.fillStyle='#000'; ctx.fillRect(0,0,w,h);
-    const cx=w/2, cy=h/2, r=Math.min(w,h)*0.46;
-    // base disk
-    ctx.fillStyle='#dfe8ff'; ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.fill();
-    // simple craters
-    for(let i=0;i<26;i++){
-      const a=Math.random()*Math.PI*2; const rr=r*(0.2+Math.random()*0.7); const d=0.08*r+Math.random()*0.16*r;
-      const x=cx+Math.cos(a)*rr; const y=cy+Math.sin(a)*rr;
-      const grd=ctx.createRadialGradient(x,y, d*0.2, x,y, d);
-      grd.addColorStop(0,'rgba(120,130,160,0.35)');
-      grd.addColorStop(1,'rgba(0,0,0,0)');
-      ctx.fillStyle=grd; ctx.beginPath(); ctx.arc(x,y,d,0,Math.PI*2); ctx.fill();
-    }
-    return new CanvasTexture(c);
-  }
-  const moonTex = makeMoonTexture();
-  const moonMat = new MeshBasicMaterial({ map: moonTex, transparent:true, depthWrite:false, side:DoubleSide, color:0xffffff });
-  const moonGeo = new PlaneGeometry(80,80);
-  const moon = new Mesh(moonGeo, moonMat);
-  moon.position.set(-600, 420, -800);
-  scene.add(moon);
-
-  // --- simple collision system with 10m chunking (XZ plane)
-  // プレイヤー本体（カプセル相当）＋物理ボディ（cannon-es）
-  const player = {
-    node: new THREE.Object3D(),
-    height: 1.60,
-    shoulderWidth: 0.42,
-    radius: 0.21,
-    eyeOffset: 1.50,
-    mass: 55,
-    grounded: false,
-  };
-  // cannon-es: プレイヤー用のカプセル（Compound Body）
-  const capsuleRadius = player.radius;
-  const cylHeight = Math.max(0.0, player.height - capsuleRadius*2);
-  const playerBody = new CANNON.Body({
-    mass: player.mass,
-    position: new CANNON.Vec3(camera.position.x, camera.position.y - player.eyeOffset, camera.position.z)
-  });
-  // 胴体円柱（Y軸方向）
-  const cyl = new CANNON.Cylinder(capsuleRadius, capsuleRadius, cylHeight, 12);
-  const qCyl = new CANNON.Quaternion(); qCyl.setFromEuler(0, 0, Math.PI/2);
-  playerBody.addShape(cyl, new CANNON.Vec3(0, 0, 0), qCyl);
-  // 頭・股関節側の球を追加
-  const sphTop = new CANNON.Sphere(capsuleRadius);
-  const sphBottom = new CANNON.Sphere(capsuleRadius);
-  playerBody.addShape(sphTop, new CANNON.Vec3(0, cylHeight/2, 0));
-  playerBody.addShape(sphBottom, new CANNON.Vec3(0, -cylHeight/2, 0));
-  world.addBody(playerBody);
-  // カメラ初期位置に合わせて本体の足元位置を設定（目線オフセットを引く）
-  player.node.position.set(
-    camera.position.x,
-    camera.position.y - player.eyeOffset,
-    camera.position.z
-  );
-  // three.js のノード位置を cannon-es のボディに合わせる初期同期
-  playerBody.position.set(player.node.position.x, player.node.position.y, player.node.position.z);
-  scene.add(player.node);
-  const playerRadius = player.radius; // 肩幅ベースの水平当たり半径
-  const CHUNK_SIZE = 10; // 10 meters per chunk
-  const circleColliders = []; // flat list (debug/optional)
-  const segmentColliders = []; // flat list (debug/optional)
-  const boxColliders = [];     // flat list of oriented boxes
-  const circleChunks = new Map(); // key:"cx,cz" -> Array<{x,z,r}>
-  const segmentChunks = new Map(); // key:"cx,cz" -> Array<segment>
-  const boxChunks = new Map();     // key:"cx,cz" -> Array<box>
-  const _tmpV = new THREE.Vector3();
-  function toChunkCoord(v){ return Math.floor(v / CHUNK_SIZE); }
-  function chunkKey(cx, cz){ return cx+','+cz; }
-  function pushCircleToChunk(obj){
-    const cx = toChunkCoord(obj.x), cz = toChunkCoord(obj.z);
-    const key = chunkKey(cx, cz);
-    let arr = circleChunks.get(key); if(!arr){ arr = []; circleChunks.set(key, arr); }
-    arr.push(obj);
-  }
-  function pushSegmentToChunks(seg){
-    const minX = Math.min(seg.ax, seg.bx) - seg.r, maxX = Math.max(seg.ax, seg.bx) + seg.r;
-    const minZ = Math.min(seg.az, seg.bz) - seg.r, maxZ = Math.max(seg.az, seg.bz) + seg.r;
-    const cminX = toChunkCoord(minX), cmaxX = toChunkCoord(maxX);
-    const cminZ = toChunkCoord(minZ), cmaxZ = toChunkCoord(maxZ);
-    for(let cz=cminZ; cz<=cmaxZ; cz++){
-      for(let cx=cminX; cx<=cmaxX; cx++){
-        const key = chunkKey(cx, cz);
-        let arr = segmentChunks.get(key); if(!arr){ arr = []; segmentChunks.set(key, arr); }
-        arr.push(seg);
-      }
-    }
-  }
-  function pushBoxToChunks(box){
-    const half = box.half;
-    const minX = box.cx - half.x;
-    const maxX = box.cx + half.x;
-    const minZ = box.cz - half.z;
-    const maxZ = box.cz + half.z;
-    const cminX = toChunkCoord(minX), cmaxX = toChunkCoord(maxX);
-    const cminZ = toChunkCoord(minZ), cmaxZ = toChunkCoord(maxZ);
-    for(let cz=cminZ; cz<=cmaxZ; cz++){
-      for(let cx=cminX; cx<=cmaxX; cx++){
-        const key = chunkKey(cx, cz);
-        let arr = boxChunks.get(key); if(!arr){ arr = []; boxChunks.set(key, arr); }
-        arr.push(box);
-      }
-    }
-  }
-  function addCollider(x, z, r){
-    const obj = { x, z, r };
-    circleColliders.push(obj);
-    pushCircleToChunk(obj);
-  }
-  function addBoxCollider(cx, cz, halfX, halfZ, rotY=0){
-    const box = {
-      cx, cz,
-      half: { x: halfX, z: halfZ },
-      rotY,
-      cos: Math.cos(rotY),
-      sin: Math.sin(rotY)
-    };
-    boxColliders.push(box);
-    pushBoxToChunks(box);
-  }
-  // cannon-es 用: 静的Box剛体を追加するヘルパー
-  function addStaticBoxBody(center, halfX, halfY, halfZ, rotY=0){
-    const shape = new CANNON.Box(new CANNON.Vec3(halfX, halfY, halfZ));
-    const body = new CANNON.Body({ mass: 0, shape });
-    body.position.set(center.x, center.y, center.z);
-    if(rotY){
-      body.quaternion.setFromEuler(0, rotY, 0);
-    }
-    world.addBody(body);
-    return body;
-  }
-  function collectNearby(posX, posZ, extraRadius=3){
-  const cx = toChunkCoord(posX), cz = toChunkCoord(posZ);
-  // LOAD CHUNK RADIUS is fixed to 4 as requested (pre-collected here via chunk maps)
-  const range = 4; // fixed load radius
-  const circles = [];
-  const segments = [];
-  const boxes = [];
-    for(let dz=-range; dz<=range; dz++){
-      for(let dx=-range; dx<=range; dx++){
-        const key = chunkKey(cx+dx, cz+dz);
-        const ca = circleChunks.get(key); if(ca) circles.push(...ca);
-    const sa = segmentChunks.get(key); if(sa) segments.push(...sa);
-    const ba = boxChunks.get(key); if(ba) boxes.push(...ba);
-      }
-    }
-  return { circles, segments, boxes };
-  }
-  function rebuildColliders(){
-  circleColliders.length = 0; segmentColliders.length = 0; boxColliders.length = 0;
-  circleChunks.clear(); segmentChunks.clear(); boxChunks.clear();
-    // street lamp poles (from instanced matrices if available)
-    // ポール自体は見えているオブジェクトなのでコライダーを残すが、
-    // 半径を少し小さめにして「見えない張り出し」を抑える。
-    if(typeof poleInst !== 'undefined' && poleInst && typeof poleInst.count === 'number'){
-      const m = new THREE.Matrix4(); const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
-      const n = poleInst.count;
-      for(let i=0;i<n;i++){
-        poleInst.getMatrixAt(i, m); m.decompose(pos, quat, scl);
-        addCollider(pos.x, pos.z, 0.3);
-      }
-    } else if(Array.isArray(lampPositions)){
-      // fallback
-      for(const p of lampPositions){ addCollider(p.x, p.z, 0.3); }
-    }
-    // utility poles (individual meshes in utilPoles)
-    if(Array.isArray(utilPoles)){
-      for(const up of utilPoles){ if(up && up.mesh && up.mesh.position){ addCollider(up.mesh.position.x, up.mesh.position.z, 0.5); } }
-    }
-    // barricades (from instanced matrices if available)
-    if(typeof barInst !== 'undefined' && barInst && typeof barInst.count === 'number'){
-      const m = new THREE.Matrix4(); const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
-      const n = barInst.count;
-      for(let i=0;i<n;i++){
-        barInst.getMatrixAt(i, m); m.decompose(pos, quat, scl);
-        // approximate as circle using half-width/depth
-        const r = 0.5 * Math.hypot(0.8*scl.x, 0.3*scl.z); // tuned
-        addCollider(pos.x, pos.z, Math.max(0.5, r));
-      }
-    } else if(Array.isArray(barricadePositions)){
-      for(const bp of barricadePositions){ addCollider(bp.x, bp.z, 0.9); }
-    }
-    // cars: use oriented box to approximate body footprint
-    if(carGroup && carGroup.children){
-      const halfX = 3.6*0.5 * 0.9; // body length half (x方向)
-      const halfZ = 1.6*0.5 * 0.9; // body width  half (z方向)
-      for(const c of carGroup.children){
-        const rotY = c.rotation.y || 0;
-        addBoxCollider(c.position.x, c.position.z, halfX, halfZ, rotY);
-      }
-    }
-    // signs / billboards: slender box roughly matching board footprint
-    if(signGroup && signGroup.children){
-      const halfX = 3.0 * 0.6; // board width half
-      const halfZ = 0.4 * 0.6; // thin depth
-      for(const s of signGroup.children){
-        const rotY = s.rotation.y || 0;
-        addBoxCollider(s.position.x, s.position.z, halfX, halfZ, rotY);
-      }
-    }
-  // neon panels
-  // ネオンパネルはほぼ床に貼られた装飾なので、プレイヤー移動の邪魔にならないよう
-  // コライダーを付けない（見た目通り「踏んで通れる」ようにする）。
-  // if(Array.isArray(neonMeshes)){
-  //   for(const n of neonMeshes){ addCollider(n.position.x, n.position.z, 1.0); }
-  // }
-    // guardrail posts (instanced)
-    if(typeof postInst !== 'undefined' && postInst && typeof postInst.count === 'number'){
-      const m = new THREE.Matrix4(); const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
-      const n = postInst.count;
-      for(let i=0;i<n;i++){
-        postInst.getMatrixAt(i, m); m.decompose(pos, quat, scl);
-        // ポール1本ごとの当たり判定がシビアだと「見えない出っ張り」に感じやすいので、
-        // 半径をわずかに縮小して通行スペースを少し広げる。
-        addCollider(pos.x, pos.z, 0.14);
-      }
-    }
-    // guardrail rails (as segment capsules)
-    if(typeof railInst !== 'undefined' && railInst && typeof railInst.count === 'number'){
-      const m = new THREE.Matrix4(); const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
-      const n = railInst.count; const localA = new THREE.Vector3(-1.5,0,0); const localB = new THREE.Vector3(1.5,0,0);
-      const ta = new THREE.Vector3(); const tb = new THREE.Vector3();
-      for(let i=0;i<n;i++){
-        railInst.getMatrixAt(i, m); m.decompose(pos, quat, scl);
-        ta.copy(localA).applyQuaternion(quat).add(pos);
-        tb.copy(localB).applyQuaternion(quat).add(pos);
-        const cx = (ta.x + tb.x) * 0.5; const cz = (ta.z + tb.z) * 0.5;
-        const hx = Math.abs(tb.x - ta.x) * 0.5; const hz = Math.abs(tb.z - ta.z) * 0.5;
-        const seg = { ax:ta.x, az:ta.z, bx:tb.x, bz:tb.z, cx, cz, hx, hz, r: 0.18 };
-        segmentColliders.push(seg);
-        pushSegmentToChunks(seg);
-      }
-    }
-    // traffic cones (use base instanced positions)
-    if(typeof coneBaseInst !== 'undefined' && coneBaseInst && typeof coneBaseInst.count === 'number'){
-      const m = new THREE.Matrix4(); const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
-      const n = coneBaseInst.count;
-      for(let i=0;i<n;i++){
-        coneBaseInst.getMatrixAt(i, m); m.decompose(pos, quat, scl);
-        addCollider(pos.x, pos.z, 0.35 * Math.max(scl.x, scl.z));
-      }
-    }
-    // composite city towers
-    if(Array.isArray(cityTowers)){
-      for(const t of cityTowers){
-        // ランドマークタワーそのものは屋上を自由に歩けるよう、円コリジョンを付けない
-        if(landmarkInfo && t === landmarkInfo) continue;
-        // それ以外のビルは見た目より少し内側に当たりを置くイメージで、半径を絞る
-        const baseR = (t.radius || 8);
-        addCollider(t.x, t.z, Math.max(2.0, baseR * 0.25));
-      }
-    }
-    // far towers (instanced)
-    // 遠景の高層ビル群は完全に背景とみなし、当たり判定を付けない。
-    // これにより、視界上はビルが見えていても、手前の実オブジェクトまでしか壁がない挙動になる。
-    // if(typeof towerInst !== 'undefined' && towerInst && typeof towerInst.count === 'number'){
-    //   const m = new THREE.Matrix4(); const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
-    //   const n = towerInst.count;
-    //   for(let i=0;i<n;i++){
-    //     towerInst.getMatrixAt(i, m); m.decompose(pos, quat, scl);
-    //     const r = 0.5 * Math.hypot(scl.x, scl.z);
-    //     addCollider(pos.x, pos.z, Math.max(0.5, r * 0.3));
-    //   }
-    // }
-  }
-  // scrap, small batteries, big batteries
-  spawnPickups(12, 8, 4);
-  rebuildColliders();
-  // コリジョン準備完了後に屋上を構築し、コリジョンを更新
-  if(landmarkInfo){
-    buildRooftopForLandmark(landmarkInfo);
-    rebuildColliders();
-  }
-  // ストーリー必須アイテムをスポーン
-  spawnStoryItems();
-  function resolveCollisionsXZ(pos, radius){
-    const { circles, segments, boxes } = collectNearby(pos.x, pos.z, 4);
-    // 空中クリアランス判定：ジャンプ中に一定高さ以上なら側面衝突を緩和
-    let airClear = false;
-    try{
-      const bodyY = (playerBody && playerBody.position && playerBody.position.y) || 0;
-      const groundY = getGroundYAt(pos.x, pos.z);
-      const airborne = (typeof player!=='undefined' && player && player.grounded===false);
-      if(airborne){
-        radius *= 0.7; // 空中時は当たりをさらに緩める
-      }
-      // 0.6m 以上浮いていれば、低い柵やコーンは越えられる前提で側面コリジョンをスキップ
-      airClear = airborne && (bodyY - groundY) > 0.6;
-    }catch(e){}
-    // circle colliders
-    for(let i=0;i<circles.length;i++){
-      const c = circles[i];
-      // 高さクリアが成立している場合は円当たりをスキップ（低い障害物は上を越える想定）
-      if(airClear) { continue; }
-      // 屋上にいる間は中央ランドマークの円当たりをスキップ（押し出し防止）
-      if(landmarkInfo){
-        const onRoof = getGroundYAt(pos.x, pos.z) >= (landmarkInfo.height - 0.05);
-        const nearLandmarkCenter = Math.hypot(c.x - landmarkInfo.x, c.z - landmarkInfo.z) < Math.max(1.0, landmarkInfo.radius * 0.2);
-        if(onRoof && nearLandmarkCenter){ continue; }
-      }
-      const dx = pos.x - c.x; const dz = pos.z - c.z;
-      const rr = radius + c.r;
-      // quick AABB-like reject to reduce sqrt calls
-      const aabbR = rr + 0.2; if(Math.abs(dx) > aabbR || Math.abs(dz) > aabbR) continue;
-      const distSq = dx*dx + dz*dz;
-      if(distSq < rr*rr){
-        const dist = Math.sqrt(Math.max(1e-6, distSq));
-        // if exactly overlapping center, nudge in a stable arbitrary direction
-        const nx = dist > 1e-6 ? dx/dist : 1.0; const nz = dist > 1e-6 ? dz/dist : 0.0;
-        // --- 小段差ステップアップ（円コライダー）: めり込みが軽微な場合に上方向へ持ち上げる ---
-        if(typeof playerBody !== 'undefined'){
-          const penetration = rr - dist;
-          // 距離が半径合計の90%未満＝軽い接触のときのみ持ち上げ補助
-          if(penetration > 0 && dist > rr * 0.5){
-            const lift = Math.min(0.4, penetration * 0.6);
-            const gy = getGroundYAt(pos.x, pos.z);
-            const by = playerBody.position.y;
-            if((by - gy) < 0.6){
-              playerBody.position.y = by + lift;
-            }
-          }
-        }
-        const penetration = rr - dist;
-        pos.x += nx * penetration; pos.z += nz * penetration;
-      }
-    }
-  // segment capsule colliders (guardrails)
-    if(!airClear){
-    // ガードレールの想定高さ（見た目に合わせる）：約1.0m
-    const guardrailHeight = 1.0;
-    for(let i=0;i<segments.length;i++){
-      const s = segments[i];
-      // coarse reject using segment AABB expanded by radius
-      const pad = radius + s.r + 0.2;
-      if(Math.abs(pos.x - s.cx) > s.hx + pad || Math.abs(pos.z - s.cz) > s.hz + pad) continue;
-      // 垂直方向の高さクリア: プレイヤーの足元Y（playerBody.position.y）と地面高差がガードレール高さを超えていれば当たり無効
-      try{
-        const gySeg = getGroundYAt(pos.x, pos.z);
-        const bySeg = (playerBody && playerBody.position && playerBody.position.y) || gySeg;
-        if((bySeg - gySeg) > guardrailHeight){
-          continue; // 上を飛んでいるので側面衝突なし
-        }
-      }catch(e){}
-      const vx = s.bx - s.ax; const vz = s.bz - s.az;
-      const len2 = vx*vx + vz*vz; if(len2 < 1e-6) continue;
-      const wx = pos.x - s.ax; const wz = pos.z - s.az;
-      let t = (wx*vx + wz*vz) / len2; if(t < 0) t = 0; else if(t > 1) t = 1;
-      const cx = s.ax + t*vx; const cz = s.az + t*vz;
-      let px = pos.x - cx; let pz = pos.z - cz;
-      const rr = radius + s.r;
-      const d2 = px*px + pz*pz;
-      if(d2 < rr*rr){
-        const d = Math.sqrt(Math.max(d2, 1e-8));
-        let nx, nz;
-        if(d > 1e-8){ nx = px/d; nz = pz/d; }
-        else { // exactly on center: use perpendicular to segment as fallback
-          const segLen = Math.sqrt(len2) || 1.0; nx = +vz/segLen; nz = -vx/segLen;
-        }
-        const penetration = rr - d;
-        pos.x += nx * penetration; pos.z += nz * penetration;
-      }
-  }
-  }
-    // oriented box colliders (for rectangular objects)
-  if(!airClear){
-  for(let i=0;i<boxes.length;i++){
-      const b = boxes[i];
-      // ローカル空間へ変換（ボックス中心を原点、Y軸回転のみ）
-      const relX = pos.x - b.cx;
-      const relZ = pos.z - b.cz;
-      const lx =  b.cos*relX + b.sin*relZ;
-      const lz = -b.sin*relX + b.cos*relZ;
-  const hx = b.half.x + radius;
-      const hz = b.half.z + radius;
-      // AABB 内にいなければ無視
-      if(Math.abs(lx) > hx || Math.abs(lz) > hz) continue;
-      // 4面のうち一番近い面から押し出す
-      const dx = hx - Math.abs(lx);
-      const dz = hz - Math.abs(lz);
-      let nx, nz, depth;
-      if(dx < dz){
-        depth = dx;
-        nx = (lx > 0) ? 1 : -1;
-        nz = 0;
-      } else {
-        depth = dz;
-        nx = 0;
-        nz = (lz > 0) ? 1 : -1;
-      }
-      // ローカル法線をワールドに戻して押し出し
-      const wx =  b.cos*nx - b.sin*nz;
-      const wz =  b.sin*nx + b.cos*nz;
-      pos.x += wx * depth;
-      pos.z += wz * depth;
-  }
-  }
-    return pos;
-  }
-
-  // --- Debug: collider visualization ---
+// --- Debug: collider visualization ---
   const debugGroup = new Group(); scene.add(debugGroup);
   let showColliders = false;
   function setShowColliders(v){ showColliders = !!v; debugGroup.visible = showColliders; }
@@ -2416,7 +1465,7 @@
     placeAt(10.0, -6.5, makePickup('battery_cell','電源セル',0x55ccff));
     // 管制室
     placeAt(-8.0, 5.8, makePickup('access_key','アクセスキー',0x9b6cff));
-    // 研究棟
+    // 研究棠
     placeAt(3.5, 9.0, makePickup('boot_chip','起動チップ',0x52e07a));
   }
 
@@ -2425,8 +1474,6 @@
   const mapOverlay = document.createElement('div');
   mapOverlay.id = 'map-overlay';
   Object.assign(mapOverlay.style, { position:'fixed', left:'0', top:'0', width:'100%', height:'100%', display:'none', background:'rgba(0,0,0,0.65)', zIndex:'9999', alignItems:'center', justifyContent:'center' });
-  mapOverlay.style.display = 'none';
-  mapOverlay.style.pointerEvents = 'none';
   const mapCanvas = document.createElement('canvas');
   const mapCtx = mapCanvas.getContext('2d');
   mapOverlay.appendChild(mapCanvas);
@@ -2789,6 +1836,9 @@
     }
     fallStartY = null;
     player.grounded = true;
+  // 地面へスナップして貫通を防ぐ（外部GLTF地形にも追従）
+  playerBody.position.y = targetY;
+  playerBody.velocity.y = 0;
   } else {
     if(player.grounded){
       // 接地から離れた瞬間に高さを記録
@@ -3113,7 +2163,7 @@
     if(p.elbowR){ p.elbowR.rotation.x = 0.4 + 0.7*Math.abs(fR); }
     if(p.wristR){ p.wristR.rotation.x = -0.4*fR; }
     if(p.clawR){ p.clawR.rotation.x = Math.max(0, -fR)*0.5; }
-    // 後肢（踵上げの趾行）
+    // 後肢
     if(p.hipL){ p.hipL.rotation.x = 0.8*hL*e.legAmp; }
     if(p.kneeL){ p.kneeL.rotation.x = 0.5 + 1.0*Math.abs(hL); }
     if(p.ankleL){ p.ankleL.rotation.x = -0.6*hL; }
@@ -3321,6 +2371,7 @@
     if(use('battery_big')) return; use('battery_small');
   }
 })();
+
   </script>
   <script>
     (function(){
