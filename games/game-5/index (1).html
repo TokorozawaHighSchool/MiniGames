@@ -62,6 +62,8 @@
   // 物理エンジン cannon-es をCDNから読み込み（最小構成：地面とプレイヤー球体）
   const CANNON = await import('https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js');
   const { Scene, PerspectiveCamera, WebGLRenderer, Color, FogExp2, DirectionalLight, AmbientLight, HemisphereLight, PlaneGeometry, MeshStandardMaterial, Mesh, Vector3, CanvasTexture, CylinderGeometry, InstancedMesh, PointLight, BoxGeometry, BufferGeometry, Points, PointsMaterial, Group, ConeGeometry, MeshBasicMaterial, DoubleSide, ShaderMaterial } = THREE;
+  // GLTFLoader をCDNから読み込み
+  const { GLTFLoader } = await import('https://cdn.jsdelivr.net/npm/three@0.152.2/examples/jsm/loaders/GLTFLoader.js');
 
   // --- 物理ワールド（cannon-es）最小セットアップ ---
   const world = new CANNON.World({
@@ -353,6 +355,23 @@
   const groundMat = new MeshStandardMaterial({ color:0x2a2e33, map: asphaltMap, roughnessMap: roughMap, roughness: 1.0, metalness: 0.0 });
   const ground = new Mesh(planeGeo, groundMat);
   ground.receiveShadow = true; scene.add(ground);
+
+  // --- 外部GLTF/GLB 読み込みヘルパー ---
+  async function loadExternalGLTF(url, { position = new THREE.Vector3(0,0,0), scale = 1.0, rotationY = 0 } = {}){
+    const loader = new GLTFLoader();
+    return new Promise((resolve, reject)=>{
+      loader.load(url, (gltf)=>{
+        const root = gltf.scene || gltf.scenes?.[0];
+        if(!root){ reject(new Error('GLTF has no scene')); return; }
+        root.traverse((obj)=>{ if(obj.isMesh){ obj.castShadow = true; obj.receiveShadow = true; }});
+        root.position.copy(position);
+        root.scale.setScalar(scale);
+        root.rotation.y = rotationY;
+        scene.add(root);
+        resolve(root);
+      }, undefined, (err)=>{ reject(err); });
+    });
+  }
 
   // roads: two crossing planes forming an intersection
   const roadTex = makeRoadTexture({w:1024,h:512,lanes:2,dashed:true});
@@ -1701,17 +1720,29 @@
   // プレイヤー本体（カプセル相当）＋物理ボディ（cannon-es）
   const player = {
     node: new THREE.Object3D(),
-    radius: 0.45,
-    eyeOffset: 1.6,
+    height: 1.60,
+    shoulderWidth: 0.42,
+    radius: 0.21,
+    eyeOffset: 1.50,
+    mass: 55,
     grounded: false,
   };
-  // cannon-es: プレイヤー用の球体ボディ（横方向の押し出しは既存ロジックを継続利用）
-  const playerShape = new CANNON.Sphere(player.radius);
+  // cannon-es: プレイヤー用のカプセル（Compound Body）
+  const capsuleRadius = player.radius;
+  const cylHeight = Math.max(0.0, player.height - capsuleRadius*2);
   const playerBody = new CANNON.Body({
-    mass: 1,
-    position: new CANNON.Vec3(camera.position.x, camera.position.y - player.eyeOffset, camera.position.z),
-    shape: playerShape
+    mass: player.mass,
+    position: new CANNON.Vec3(camera.position.x, camera.position.y - player.eyeOffset, camera.position.z)
   });
+  // 胴体円柱（Y軸方向）
+  const cyl = new CANNON.Cylinder(capsuleRadius, capsuleRadius, cylHeight, 12);
+  const qCyl = new CANNON.Quaternion(); qCyl.setFromEuler(0, 0, Math.PI/2);
+  playerBody.addShape(cyl, new CANNON.Vec3(0, 0, 0), qCyl);
+  // 頭・股関節側の球を追加
+  const sphTop = new CANNON.Sphere(capsuleRadius);
+  const sphBottom = new CANNON.Sphere(capsuleRadius);
+  playerBody.addShape(sphTop, new CANNON.Vec3(0, cylHeight/2, 0));
+  playerBody.addShape(sphBottom, new CANNON.Vec3(0, -cylHeight/2, 0));
   world.addBody(playerBody);
   // カメラ初期位置に合わせて本体の足元位置を設定（目線オフセットを引く）
   player.node.position.set(
@@ -1722,7 +1753,7 @@
   // three.js のノード位置を cannon-es のボディに合わせる初期同期
   playerBody.position.set(player.node.position.x, player.node.position.y, player.node.position.z);
   scene.add(player.node);
-  const playerRadius = player.radius; // プレイヤーの水平当たり半径
+  const playerRadius = player.radius; // 肩幅ベースの水平当たり半径
   const CHUNK_SIZE = 10; // 10 meters per chunk
   const circleColliders = []; // flat list (debug/optional)
   const segmentColliders = []; // flat list (debug/optional)
@@ -1947,12 +1978,17 @@
       const bodyY = (playerBody && playerBody.position && playerBody.position.y) || 0;
       const groundY = getGroundYAt(pos.x, pos.z);
       const airborne = (typeof player!=='undefined' && player && player.grounded===false);
+      if(airborne){
+        radius *= 0.7; // 空中時は当たりをさらに緩める
+      }
       // 0.6m 以上浮いていれば、低い柵やコーンは越えられる前提で側面コリジョンをスキップ
       airClear = airborne && (bodyY - groundY) > 0.6;
     }catch(e){}
     // circle colliders
     for(let i=0;i<circles.length;i++){
       const c = circles[i];
+      // 高さクリアが成立している場合は円当たりをスキップ（低い障害物は上を越える想定）
+      if(airClear) { continue; }
       // 屋上にいる間は中央ランドマークの円当たりをスキップ（押し出し防止）
       if(landmarkInfo){
         const onRoof = getGroundYAt(pos.x, pos.z) >= (landmarkInfo.height - 0.05);
@@ -1968,17 +2004,40 @@
         const dist = Math.sqrt(Math.max(1e-6, distSq));
         // if exactly overlapping center, nudge in a stable arbitrary direction
         const nx = dist > 1e-6 ? dx/dist : 1.0; const nz = dist > 1e-6 ? dz/dist : 0.0;
+        // --- 小段差ステップアップ（円コライダー）: めり込みが軽微な場合に上方向へ持ち上げる ---
+        if(typeof playerBody !== 'undefined'){
+          const penetration = rr - dist;
+          // 距離が半径合計の90%未満＝軽い接触のときのみ持ち上げ補助
+          if(penetration > 0 && dist > rr * 0.5){
+            const lift = Math.min(0.4, penetration * 0.6);
+            const gy = getGroundYAt(pos.x, pos.z);
+            const by = playerBody.position.y;
+            if((by - gy) < 0.6){
+              playerBody.position.y = by + lift;
+            }
+          }
+        }
         const penetration = rr - dist;
         pos.x += nx * penetration; pos.z += nz * penetration;
       }
     }
   // segment capsule colliders (guardrails)
     if(!airClear){
+    // ガードレールの想定高さ（見た目に合わせる）：約1.0m
+    const guardrailHeight = 1.0;
     for(let i=0;i<segments.length;i++){
       const s = segments[i];
       // coarse reject using segment AABB expanded by radius
       const pad = radius + s.r + 0.2;
       if(Math.abs(pos.x - s.cx) > s.hx + pad || Math.abs(pos.z - s.cz) > s.hz + pad) continue;
+      // 垂直方向の高さクリア: プレイヤーの足元Y（playerBody.position.y）と地面高差がガードレール高さを超えていれば当たり無効
+      try{
+        const gySeg = getGroundYAt(pos.x, pos.z);
+        const bySeg = (playerBody && playerBody.position && playerBody.position.y) || gySeg;
+        if((bySeg - gySeg) > guardrailHeight){
+          continue; // 上を飛んでいるので側面衝突なし
+        }
+      }catch(e){}
       const vx = s.bx - s.ax; const vz = s.bz - s.az;
       const len2 = vx*vx + vz*vz; if(len2 < 1e-6) continue;
       const wx = pos.x - s.ax; const wz = pos.z - s.az;
@@ -2008,7 +2067,7 @@
       const relZ = pos.z - b.cz;
       const lx =  b.cos*relX + b.sin*relZ;
       const lz = -b.sin*relX + b.cos*relZ;
-      const hx = b.half.x + radius;
+  const hx = b.half.x + radius;
       const hz = b.half.z + radius;
       // AABB 内にいなければ無視
       if(Math.abs(lx) > hx || Math.abs(lz) > hz) continue;
@@ -2060,7 +2119,7 @@
   const speed = 8.0;
   const hVel = new Vector3(0,0,0);
   const accel = 40.0, deccel = 30.0;
-  const jumpSpeed = 10.0;
+  const jumpSpeed = 15.5;
   // 連続ジャンプ防止用のクールダウン
   let jumpCooldown = 0.0;
   const jumpCooldownDur = 0.2; // 秒
